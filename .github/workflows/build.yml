@@ -1,0 +1,72 @@
+name: build
+
+# On every push and pull request: build qemu-system-mips with the
+# rtl8196e machine from pristine QEMU 8.2.2 + the fork patch, and
+# upload the binary as a downloadable artifact.
+# On a version tag (v*): publish a GitHub Release with the binary.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libglib2.0-dev libpixman-1-dev ninja-build python3 \
+            curl xz-utils patch zip file
+
+      - name: Build qemu-system-mips (rtl8196e)
+        run: ./build-qemu.sh
+
+      - name: Proof - the rtl8196e machine is in the binary
+        run: |
+          build/qemu-system-mips --version
+          build/qemu-system-mips -machine help | grep rtl8196e
+
+      - name: Zip the binary
+        run: |
+          cp build/qemu-system-mips .
+          zip -q qemu-system-mips-rtl8196e.zip qemu-system-mips
+
+      - name: Upload the binary as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lexra-qemu
+          path: qemu-system-mips-rtl8196e.zip
+          retention-days: 90
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download the build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lexra-qemu
+          path: artifacts
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mv artifacts/qemu-system-mips-rtl8196e.zip \
+             "artifacts/qemu-system-mips-rtl8196e-$TAG.zip"
+          gh release create "$TAG" artifacts/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes
