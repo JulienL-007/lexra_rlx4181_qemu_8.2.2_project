@@ -1,0 +1,7 @@
+build/
+qemu/
+qemu-8.2.2.tar.xz
+.make-patch-work/
+make-patch-diff.txt
+__pycache__/
+*.zip
