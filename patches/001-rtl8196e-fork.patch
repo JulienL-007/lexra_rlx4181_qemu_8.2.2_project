@@ -1,0 +1,2608 @@
+diff -ruN a/qemu-8.2.2/hw/char/meson.build b/qemu-8.2.2/hw/char/meson.build
+--- a/qemu-8.2.2/hw/char/meson.build	2024-03-04 12:48:15.000000000 -0500
++++ b/qemu-8.2.2/hw/char/meson.build	2026-11-10 21:23:01.889249987 -0500
+@@ -38,3 +38,4 @@
+ specific_ss.add(when: 'CONFIG_TERMINAL3270', if_true: files('terminal3270.c'))
+ specific_ss.add(when: 'CONFIG_VIRTIO', if_true: files('virtio-serial-bus.c'))
+ specific_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr_vty.c'))
++system_ss.add(when: 'CONFIG_RTL8196E', if_true: files('rtl8196e_uart.c'))
+diff -ruN a/qemu-8.2.2/hw/char/rtl8196e_uart.c b/qemu-8.2.2/hw/char/rtl8196e_uart.c
+--- a/qemu-8.2.2/hw/char/rtl8196e_uart.c	1969-12-31 19:00:00.000000000 -0500
++++ b/qemu-8.2.2/hw/char/rtl8196e_uart.c	2026-11-10 22:56:21.515272998 -0500
+@@ -0,0 +1,131 @@
++/*
++ * RTL8196E UART wrapper around the QEMU 16550A serial core.
++ * Lane contract established from the decompiled bootcode (stage 1
++ * writes divisor/LCR as 32-bit words with the value in bits 31:24)
++ * and the vendor kernel's 8250 probing (byte accesses, regshift 2).
++ */
++#include "qemu/osdep.h"
++#include "hw/char/rtl8196e_uart.h"
++#include "hw/qdev-properties.h"
++#include "hw/sysbus.h"
++#include "qapi/error.h"
++
++#define RTL_UART_WINDOW 0x100
++#define RTL_UART_REGS   0x20 /* 8 registers, 4 bytes apart */
++
++static uint64_t rtl_uart_read(void *opaque, hwaddr offset, unsigned size)
++{
++    RTL8196EUart *s = opaque;
++    uint64_t byte;
++    unsigned reg;
++
++    if (offset >= RTL_UART_REGS) {
++        return 0;
++    }
++    reg = (offset >> 2) & 7;
++    byte = serial_io_ops.read(&s->serial, reg, 1);
++    switch (size) {
++    case 1:
++        return (offset & 3) == 0 ? byte : 0;
++    case 2:
++        return (offset & 3) == 0 ? (byte << 8) : 0;
++    case 4:
++        return (offset & 3) == 0 ? (byte << 24) : 0;
++    default:
++        return 0;
++    }
++}
++
++static void rtl_uart_write(void *opaque, hwaddr offset, uint64_t value,
++                           unsigned size)
++{
++    RTL8196EUart *s = opaque;
++    unsigned reg;
++    uint8_t byte;
++
++    if (offset >= RTL_UART_REGS || (offset & 3) != 0) {
++        return;
++    }
++    reg = (offset >> 2) & 7;
++    switch (size) {
++    case 1:
++        byte = value & 0xff;
++        break;
++    case 2:
++        byte = (value >> 8) & 0xff;
++        break;
++    case 4:
++        byte = (value >> 24) & 0xff;
++        break;
++    default:
++        return;
++    }
++    serial_io_ops.write(&s->serial, reg, byte, 1);
++}
++
++static const MemoryRegionOps rtl_uart_ops = {
++    .read = rtl_uart_read,
++    .write = rtl_uart_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++};
++
++static void rtl_uart_realize(DeviceState *dev, Error **errp)
++{
++    RTL8196EUart *s = RTL8196E_UART(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++
++    if (!qdev_realize(DEVICE(&s->serial), NULL, errp)) {
++        return;
++    }
++    /* the hub's UART clock is the 200 MHz system clock */
++    serial_set_frequency(&s->serial, 200000000);
++    sysbus_init_irq(sbd, &s->serial.irq);
++    memory_region_init_io(&s->mmio, OBJECT(dev), &rtl_uart_ops, s,
++                          "rtl8196e-uart", RTL_UART_WINDOW);
++    sysbus_init_mmio(sbd, &s->mmio);
++}
++
++static void rtl_uart_reset_hold(Object *obj)
++{
++    RTL8196EUart *s = RTL8196E_UART(obj);
++
++    device_cold_reset(DEVICE(&s->serial));
++}
++
++static void rtl_uart_init(Object *obj)
++{
++    RTL8196EUart *s = RTL8196E_UART(obj);
++
++    object_initialize_child(obj, "serial", &s->serial, TYPE_SERIAL);
++    object_property_add_alias(obj, "chardev", OBJECT(&s->serial),
++                              "chardev");
++}
++
++static void rtl_uart_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->realize = rtl_uart_realize;
++    dc->desc = "RTL8196E UART (16550A, SoC lane wiring)";
++    rc->phases.hold = rtl_uart_reset_hold;
++}
++
++static const TypeInfo rtl_uart_type_info = {
++    .name = TYPE_RTL8196E_UART,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(RTL8196EUart),
++    .instance_init = rtl_uart_init,
++    .class_init = rtl_uart_class_init,
++};
++
++static void rtl_uart_register_types(void)
++{
++    type_register_static(&rtl_uart_type_info);
++}
++
++type_init(rtl_uart_register_types)
+diff -ruN a/qemu-8.2.2/hw/mips/Kconfig b/qemu-8.2.2/hw/mips/Kconfig
+--- a/qemu-8.2.2/hw/mips/Kconfig	2024-03-04 12:48:15.000000000 -0500
++++ b/qemu-8.2.2/hw/mips/Kconfig	2026-11-10 21:23:01.887249987 -0500
+@@ -63,3 +63,9 @@
+ 
+ config FW_CFG_MIPS
+     bool
++
++config RTL8196E
++    bool
++    default y
++    depends on MIPS
++    select SERIAL
+diff -ruN a/qemu-8.2.2/hw/mips/meson.build b/qemu-8.2.2/hw/mips/meson.build
+--- a/qemu-8.2.2/hw/mips/meson.build	2024-03-04 12:48:15.000000000 -0500
++++ b/qemu-8.2.2/hw/mips/meson.build	2026-11-10 21:23:01.888249987 -0500
+@@ -13,3 +13,4 @@
+ endif
+ 
+ hw_arch += {'mips': mips_ss}
++mips_ss.add(when: 'CONFIG_RTL8196E', if_true: files('rtl8196e.c'))
+diff -ruN a/qemu-8.2.2/hw/mips/mips_int.c b/qemu-8.2.2/hw/mips/mips_int.c
+--- a/qemu-8.2.2/hw/mips/mips_int.c	2024-03-04 12:48:15.000000000 -0500
++++ b/qemu-8.2.2/hw/mips/mips_int.c	2026-11-10 23:49:24.319248478 -0500
+@@ -68,6 +68,52 @@
+     g_free(qi);
+ }
+ 
++/*
++ * Lexra LOPI input lines (RLX4181): line levels are reflected into
++ * ECause bits 16..23; delivery itself is decided in
++ * cpu_mips_hw_interrupts_pending() / mips_cpu_do_interrupt().
++ */
++static void cpu_mips_lx_irq_request(void *opaque, int irq, int level)
++{
++    MIPSCPU *cpu = opaque;
++    CPUMIPSState *env = &cpu->env;
++    CPUState *cs = CPU(cpu);
++    bool lopi_pending;
++
++    if (irq < 0 || irq > 7) {
++        return;
++    }
++
++    QEMU_IOTHREAD_LOCK_GUARD();
++
++    if (level) {
++        env->CP0_LXReg[1] |= 1u << (irq + 16);
++    } else {
++        env->CP0_LXReg[1] &= ~(1u << (irq + 16));
++    }
++
++    lopi_pending = env->CP0_LXReg[2] != 0 &&
++        (env->CP0_LXReg[1] & env->CP0_LXReg[0] & 0x00ff0000) != 0;
++    if ((env->CP0_Cause & CP0Ca_IP_mask) || lopi_pending) {
++        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
++    } else {
++        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
++    }
++}
++
++void cpu_mips_lx_irq_init_cpu(MIPSCPU *cpu)
++{
++    CPUMIPSState *env = &cpu->env;
++    qemu_irq *qi;
++    int i;
++
++    qi = qemu_allocate_irqs(cpu_mips_lx_irq_request, cpu, 8);
++    for (i = 0; i < 8; i++) {
++        env->lx_irq[i] = qi[i];
++    }
++    g_free(qi);
++}
++
+ void cpu_mips_soft_irq(CPUMIPSState *env, int irq, int level)
+ {
+     if (irq < 0 || irq > 2) {
+diff -ruN a/qemu-8.2.2/hw/mips/rtl8196e.c b/qemu-8.2.2/hw/mips/rtl8196e.c
+--- a/qemu-8.2.2/hw/mips/rtl8196e.c	1969-12-31 19:00:00.000000000 -0500
++++ b/qemu-8.2.2/hw/mips/rtl8196e.c	2026-11-11 04:27:51.709980457 -0500
+@@ -0,0 +1,144 @@
++/*
++ * Machine for the Sengled Z02-HUB emulation bench: Realtek RTL8196E
++ * SoC, 32 MiB DRAM (proven from the bootcode's DCR write, see
++ * emulation-design.md), SPI flash backed by a stock dump image, two
++ * UARTs (console + EM357), and the SoC register blocks.
++ *
++ * Usage: -machine rtl8196e,flash=<fullflash-8mb.bin>
++ */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/units.h"
++#include "exec/address-spaces.h"
++#include "exec/memory.h"
++#include "hw/boards.h"
++#include "hw/mips/mips.h"
++#include "hw/qdev-properties.h"
++#include "target/mips/cpu.h"
++#include "hw/misc/rtl8196e_soc.h"
++#include "hw/char/rtl8196e_uart.h"
++#include "hw/sysbus.h"
++#include "sysemu/sysemu.h"
++#include "net/net.h"
++
++#define TYPE_RTL8196E_MACHINE MACHINE_TYPE_NAME("rtl8196e")
++OBJECT_DECLARE_SIMPLE_TYPE(RTL8196EMachineState, RTL8196E_MACHINE)
++
++struct RTL8196EMachineState {
++    MachineState parent_obj;
++
++    char *flash_file;
++};
++
++#define RTL_RAM_SIZE (32 * MiB)
++#define RTL_UART0_BASE 0x18002000
++#define RTL_UART1_BASE 0x18002100
++/* IRQ source numbers come from hw/misc/rtl8196e_soc.h (the BSP
++ * GIMR-bit map: UART0 = 12, UART1 = 13). A local define here once
++ * wired UART0 to source 7 (the superseded design-section map),
++ * which silently cost the console its interrupts: kernel printk
++ * (polled) worked, interrupt-driven tty output never drained. */
++
++static void rtl8196e_init(MachineState *machine)
++{
++    RTL8196EMachineState *rms = RTL8196E_MACHINE(machine);
++    MIPSCPU *cpu;
++    CPUMIPSState *env;
++    DeviceState *soc;
++    SysBusDevice *soc_sbd;
++    MemoryRegion *ram = g_new0(MemoryRegion, 1);
++    int i;
++    cpu = MIPS_CPU(cpu_create(machine->cpu_type));
++    env = &cpu->env;
++    cpu_mips_irq_init_cpu(cpu);
++    cpu_mips_lx_irq_init_cpu(cpu);
++
++    memory_region_init_ram(ram, NULL, "rtl8196e.ram", RTL_RAM_SIZE,
++                           &error_fatal);
++
++    memory_region_add_subregion(get_system_memory(), 0, ram);
++
++    soc = qdev_new(TYPE_RTL8196E_SOC);
++    if (rms->flash_file) {
++        qdev_prop_set_string(soc, "flash", rms->flash_file);
++    }
++    if (nd_table[0].used) {
++        qdev_set_nic_properties(soc, &nd_table[0]);
++    }
++    soc_sbd = SYS_BUS_DEVICE(soc);
++    sysbus_realize_and_unref(soc_sbd, &error_fatal);
++    sysbus_mmio_map(soc_sbd, 0, RTL_SOC_BASE);
++    for (i = 0; i < 8; i++) {
++        sysbus_connect_irq(soc_sbd, i, env->irq[i]);
++    }
++    for (i = 0; i < 8; i++) {
++        sysbus_connect_irq(soc_sbd, 8 + i, env->lx_irq[i]);
++    }
++
++    for (i = 0; i < 2; i++) {
++        DeviceState *uart = qdev_new(TYPE_RTL8196E_UART);
++        SysBusDevice *uart_sbd = SYS_BUS_DEVICE(uart);
++        Chardev *chr = serial_hd(i);
++
++        if (chr) {
++            qdev_prop_set_chr(uart, "chardev", chr);
++        }
++        sysbus_realize_and_unref(uart_sbd, &error_fatal);
++        memory_region_add_subregion_overlap(
++            get_system_memory(),
++            i == 0 ? RTL_UART0_BASE : RTL_UART1_BASE,
++            sysbus_mmio_get_region(uart_sbd, 0), 1);
++        sysbus_connect_irq(uart_sbd, 0,
++                           qdev_get_gpio_in_named(soc, "src",
++                                                  i == 0 ? RTL_IRQ_UART0
++                                                         : RTL_IRQ_UART1));
++    }
++}
++
++static char *rtl8196e_flash_get(Object *obj, Error **errp)
++{
++    RTL8196EMachineState *rms = RTL8196E_MACHINE(obj);
++
++    return g_strdup(rms->flash_file);
++}
++
++static void rtl8196e_flash_set(Object *obj, const char *value,
++                               Error **errp)
++{
++    RTL8196EMachineState *rms = RTL8196E_MACHINE(obj);
++
++    g_free(rms->flash_file);
++    rms->flash_file = g_strdup(value);
++}
++
++static void rtl8196e_class_init(ObjectClass *oc, void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++
++    mc->desc = "Sengled Z02-HUB (Realtek RTL8196E) emulation bench";
++    mc->init = rtl8196e_init;
++    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("rlx4181");
++    mc->default_ram_size = RTL_RAM_SIZE;
++    mc->max_cpus = 1;
++    mc->minimum_page_bits = 12;
++
++    object_class_property_add_str(oc, "flash", rtl8196e_flash_get,
++                                  rtl8196e_flash_set);
++    object_class_property_set_description(oc, "flash",
++        "Path to the 8 MiB flash image (stock dump) backing the bench");
++}
++
++static const TypeInfo rtl8196e_machine_type_info = {
++    .name = TYPE_RTL8196E_MACHINE,
++    .parent = TYPE_MACHINE,
++    .instance_size = sizeof(RTL8196EMachineState),
++    .class_init = rtl8196e_class_init,
++    .class_size = sizeof(MachineClass),
++};
++
++static void rtl8196e_machine_register_types(void)
++{
++    type_register_static(&rtl8196e_machine_type_info);
++}
++
++type_init(rtl8196e_machine_register_types)
+diff -ruN a/qemu-8.2.2/hw/misc/meson.build b/qemu-8.2.2/hw/misc/meson.build
+--- a/qemu-8.2.2/hw/misc/meson.build	2024-03-04 12:48:15.000000000 -0500
++++ b/qemu-8.2.2/hw/misc/meson.build	2026-11-10 21:23:01.888249987 -0500
+@@ -154,3 +154,4 @@
+ 
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
++system_ss.add(when: 'CONFIG_RTL8196E', if_true: files('rtl8196e_soc.c'))
+diff -ruN a/qemu-8.2.2/hw/misc/rtl8196e_soc.c b/qemu-8.2.2/hw/misc/rtl8196e_soc.c
+--- a/qemu-8.2.2/hw/misc/rtl8196e_soc.c	1969-12-31 19:00:00.000000000 -0500
++++ b/qemu-8.2.2/hw/misc/rtl8196e_soc.c	2026-11-11 16:18:56.932618437 -0500
+@@ -0,0 +1,1314 @@
++/*
++ * RTL8196E SoC block for the Sengled Z02-HUB emulation bench.
++ *
++ * Register contracts: vendor kernel source (arch/mips rtl8196c
++ * platform.h; arch/rlx BSP symbol names) and the decompiled bootcode.
++ * See emulation-design.md in the bench repository root.
++ */
++#include "qemu/osdep.h"
++#include "exec/address-spaces.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "hw/misc/rtl8196e_soc.h"
++#include "hw/qdev-properties.h"
++#include "hw/sysbus.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "sysemu/runstate.h"
++#include "sysemu/sysemu.h"
++
++/* register offsets within the aperture */
++#define REG_REVR        0x0000
++#define REG_RESETCAUSE  0x0008
++#define REG_STRAP       0x000c
++#define REG_SFCR        0x1200
++#define REG_SFCR2       0x1204
++#define REG_SFCSR       0x1208
++#define REG_SFDR        0x120c
++#define REG_SFDR2       0x1210
++#define REG_GIMR        0x3000
++#define REG_GISR        0x3004
++#define REG_IRR0        0x3008
++#define REG_TC0DATA     0x3100
++#define REG_TC1DATA     0x3104
++#define REG_TC0CNT      0x3108
++#define REG_TC1CNT      0x310c
++#define REG_TCCNR       0x3110
++#define REG_TCIR        0x3114
++#define REG_CDBR        0x3118
++#define REG_WDTCNR      0x311c
++
++#define CHIP_ID_8196E   0x8196e000
++#define RESET_CAUSE_WDT (1u << 23)
++
++/* TCCNR bits */
++#define TC0EN   (1u << 31)
++#define TC0MODE (1u << 30)
++#define TC1EN   (1u << 29)
++#define TC1MODE (1u << 28)
++/* TCIR bits */
++#define TC0IE   (1u << 31)
++#define TC1IE   (1u << 30)
++#define TC0IP   (1u << 29)
++#define TC1IP   (1u << 28)
++
++#define WDT_KICK_BIT    (1u << 23)
++/* Watchdog period: a calibration, not a discovered constant (design
++ * section 3.6). The healthy kernel kicks it on every 10 ms timer tick;
++ * 2 s of virtual time leaves two orders of magnitude of margin while
++ * still catching a dead kernel quickly. */
++#define WDT_PERIOD_NS   (2LL * 1000 * 1000 * 1000)
++
++/* survives the device reset that the watchdog itself requests */
++static uint32_t pending_reset_cause;
++
++static void rtl_soc_update_irq(RTL8196ESoc *s)
++{
++    /*
++     * The IRR nibble selects the CPU-visible line directly
++     * (bspchip.h: BSP_*_RS values are BSP IRQ numbers): 0..7 are
++     * the CP0 interrupt pins (ip_out 0..7); 8..15 are the Lexra
++     * LOPI lines (ip_out 8..15), delivered through the CPU's
++     * EStatus/ECause/IntVec registers.
++     */
++    bool ip[16] = { false };
++    uint32_t active = s->src_level & s->gimr;
++    int src;
++
++    for (src = 0; src < 32; src++) {
++        if (active & (1u << src)) {
++            uint32_t rs = (s->irr[src / 8] >> ((src % 8) * 4)) & 0xf;
++            ip[rs] = true;
++        }
++    }
++    for (int i = 0; i < 16; i++) {
++        if (ip[i] != ((s->ip_sent >> i) & 1)) {
++            s->ip_sent = deposit32(s->ip_sent, i, 1, ip[i] ? 1 : 0);
++            qemu_set_irq(s->ip_out[i], ip[i]);
++        }
++    }
++}
++
++static void rtl_soc_set_src(void *opaque, int n, int level)
++{
++    RTL8196ESoc *s = opaque;
++
++    s->src_level = deposit32(s->src_level, n, 1, level ? 1 : 0);
++    rtl_soc_update_irq(s);
++}
++
++/* ---- CPU packet interface (Phase 3) ----
++ *
++ * The switch core's CPU DMA engine, contract from the vendor
++ * driver (drivers/net/rtl819x/rtl865xc_swNic.c, common/mbuf.h,
++ * AsicDriver/rtl865xc_asicregs.h); design section 3.10.
++ *
++ * Rings live in guest RAM: arrays of 32-bit words, each word a
++ * descriptor pointer with bit0 = Own (1 = switch-owned) and
++ * bit1 = Wrap. Guest pointers are kseg0/kseg1 addresses; the
++ * physical address is the low 29 bits. All guest structures are
++ * big-endian.
++ *
++ * Rx: a frame from the backend is written into the cluster of
++ * the pkthdr at the ASIC cursor of ring 0 (all CPUQDM queues map
++ * to ring 0 on this hub), the pkthdr is stamped the way the
++ * Rome ASIC stamps it (ph_len includes the 4 FCS bytes the
++ * driver subtracts, both checksum-ok bits set -- the driver's
++ * receive path drops any frame without them, source portlist =
++ * the board's single external port 0, ph_vlanId = that port's
++ * group vid 9), the entry's Own bit is cleared and RX_DONE
++ * pends. The paired Rx mbuf ring entry (same order) is consumed
++ * with it. With no switch-owned entry the frame drops and the
++ * RUNOUT bits pend, as on silicon.
++ *
++ * Tx: when the driver sets CPUICR.TXFD, every switch-owned Tx
++ * entry is gathered from its mbuf chain (m_len bytes at m_data,
++ * chain ends at MBUF_EOR), emitted to the backend, returned to
++ * the driver (Own cleared) with TX_DONE (and TX_ALL_DONE once
++ * the ring drains) pending; TXFD self-clears.
++ *
++ * Documented limits (what this cannot catch): no FCS/CRC is
++ * computed or checked in either direction (frames with bad
++ * checksums are accepted and marked checksum-ok); no ASIC
++ * table lookup is performed -- every CPU-originated frame is
++ * emitted to the segment and every segment frame is delivered
++ * to the CPU port, which on a two-node segment is the board's
++ * real topology but cannot exercise flooding/learning
++ * decisions among the unpopulated ports; no rate limiting,
++ * QoS queues or 802.1Q tag insertion/removal beyond the
++ * ingress PVID stamp above; descriptor timing is synchronous
++ * (TX completes inside the TXFD write), so guest races that
++ * depend on DMA latency do not reproduce.
++ */
++
++#define CPUICR_TXCMD   (1u << 31)
++#define CPUICR_RXCMD   (1u << 30)
++#define CPUICR_TXFD    (1u << 23)
++#define CPUICR_SOFTRST (1u << 22)
++
++#define CPUIISR_LINK_CHANGE   (1u << 31)
++#define CPUIISR_MBUF_RUNOUT   (1u << 11)
++#define CPUIISR_PKT_RUNOUT(r) (1u << (17 + (r)))
++#define CPUIISR_TX_DONE(r)    (1u << (9 + (r)))
++#define CPUIISR_TX_ALL_DONE(r) (1u << (1 + (r)))
++#define CPUIISR_RX_DONE(r)    (1u << (3 + (r)))
++
++/* struct rtl_pktHdr / rtl_mBuf field offsets (common/mbuf.h) */
++#define PH_MBUF    0x00
++#define PH_LEN     0x04
++/* struct rtl_pktHdr field offsets (common/mbuf.h): ph_flags is the
++ * u16 at +0x0C (after ph_reason at +0x0A), ph_portlist the u8 at
++ * +0x0F (after ph_orgtos), ph_vlanId the low 12 bits of the u16 at
++ * +0x10. Stamping +0x0E/+0x11/+0x12 (an earlier draft's guess) put
++ * the checksum bits into ph_orgtos/ph_portlist and the vid into
++ * _flags2, so the driver dropped every frame at its csum gate. */
++#define PH_FLAGS   0x0c
++#define PH_PORTLIST 0x0f
++#define PH_VLAN    0x10
++#define MB_NEXT    0x00
++#define MB_LEN     0x08
++#define MB_FLAGS   0x0a
++#define MB_DATA    0x0c
++#define MB_EXTBUF  0x10
++#define MB_EXTSIZE 0x14
++#define MBUF_EOR   0x04
++
++/* On receive the ASIC stamps ph_portlist with the source port INDEX:
++ * rtl_decideRxDevice() selects the net_device by (cp->portmask &
++ * (1 << pid)), so pid is a bit number, not a mask (the TX direction
++ * does use a mask). The bench's one populated external port is 0. */
++#define HUB_EXT_PORTLIST 0x00
++#define HUB_EXT_PORT_VID 9    /* its VLAN group (driver boot log) */
++
++static uint32_t guest_pa(uint32_t va)
++{
++    return va & 0x1fffffff;
++}
++
++static uint32_t dma_rd32(RTL8196ESoc *s, uint32_t pa)
++{
++    uint8_t b[4];
++
++    address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
++                       b, 4);
++    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
++           ((uint32_t)b[2] << 8) | b[3];
++}
++
++static void dma_wr32(RTL8196ESoc *s, uint32_t pa, uint32_t v)
++{
++    uint8_t b[4] = { v >> 24, v >> 16, v >> 8, v };
++
++    address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
++                        b, 4);
++}
++
++static uint16_t dma_rd16(RTL8196ESoc *s, uint32_t pa)
++{
++    uint8_t b[2];
++
++    address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
++                       b, 2);
++    return ((uint32_t)b[0] << 8) | b[1];
++}
++
++static void dma_wr16(RTL8196ESoc *s, uint32_t pa, uint16_t v)
++{
++    uint8_t b[2] = { v >> 8, v };
++
++    address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
++                        b, 2);
++}
++
++static void dma_wr8(RTL8196ESoc *s, uint32_t pa, uint8_t v)
++{
++    address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
++                        &v, 1);
++}
++
++static void cpuif_update_irq(RTL8196ESoc *s)
++{
++    int lvl = (s->cpuiisr & s->cpuiimr) != 0;
++
++    if (lvl != ((s->src_level >> RTL_IRQ_SWCORE) & 1)) {
++        s->src_level = deposit32(s->src_level, RTL_IRQ_SWCORE, 1, lvl);
++        rtl_soc_update_irq(s);
++    }
++}
++
++static void cpuif_deliver(RTL8196ESoc *s, const uint8_t *buf, size_t len)
++{
++    uint32_t ring = 0, base, entry, pkthdr, mbuf, extbuf;
++    uint16_t extsize, flags, vlan;
++
++    if (!(s->cpuicr & CPUICR_RXCMD)) {
++        s->nic_rx_runout++;
++        return;
++    }
++    base = s->rpdcr[ring];
++    if (base == 0) {
++        s->nic_rx_runout++;
++        return;
++    }
++    entry = dma_rd32(s, guest_pa(base) + 4 * s->rx_cur[ring]);
++    if (!(entry & 1)) {
++        /* no switch-owned descriptor: silicon drops + RUNOUT */
++        s->cpuiisr |= CPUIISR_PKT_RUNOUT(ring) | CPUIISR_MBUF_RUNOUT;
++        s->nic_rx_runout++;
++        cpuif_update_irq(s);
++        return;
++    }
++    pkthdr = guest_pa(entry & ~3u);
++    mbuf = guest_pa(dma_rd32(s, pkthdr + PH_MBUF));
++    extbuf = guest_pa(dma_rd32(s, mbuf + MB_EXTBUF));
++    extsize = dma_rd16(s, mbuf + MB_EXTSIZE);
++    if (len > extsize) {
++        s->nic_rx_runout++;
++        return;
++    }
++    address_space_write(&address_space_memory, extbuf,
++                        MEMTXATTRS_UNSPECIFIED, buf, len);
++    dma_wr16(s, mbuf + MB_LEN, len);
++    dma_wr16(s, pkthdr + PH_LEN, len + 4); /* +4: FCS the driver strips */
++    flags = dma_rd16(s, pkthdr + PH_FLAGS);
++    dma_wr16(s, pkthdr + PH_FLAGS, flags | 0x0003); /* CSUM_*_OK */
++    dma_wr8(s, pkthdr + PH_PORTLIST, HUB_EXT_PORTLIST);
++    vlan = dma_rd16(s, pkthdr + PH_VLAN);
++    dma_wr16(s, pkthdr + PH_VLAN, (vlan & 0xf000) | HUB_EXT_PORT_VID);
++    /* hand the descriptor to the CPU, consume the paired mbuf */
++    dma_wr32(s, guest_pa(base) + 4 * s->rx_cur[ring], entry & ~1u);
++    if (s->rmdcr) {
++        uint32_t mentry = dma_rd32(s, guest_pa(s->rmdcr) + 4 * s->mbuf_cur);
++        dma_wr32(s, guest_pa(s->rmdcr) + 4 * s->mbuf_cur, mentry & ~1u);
++        s->mbuf_cur++;
++        if (mentry & 2) {
++            s->mbuf_cur = 0;
++        }
++    }
++    s->rx_cur[ring] = (entry & 2) ? 0 : s->rx_cur[ring] + 1;
++    s->cpuiisr |= CPUIISR_RX_DONE(ring);
++    s->nic_rx_delivered++;
++    cpuif_update_irq(s);
++}
++
++static ssize_t cpuif_receive(NetClientState *nc, const uint8_t *buf,
++                             size_t size)
++{
++    RTL8196ESoc *s = qemu_get_nic_opaque(nc);
++
++    cpuif_deliver(s, buf, size);
++    return size;
++}
++
++static bool cpuif_can_receive(NetClientState *nc)
++{
++    return true; /* drops happen inside, with RUNOUT, as on silicon */
++}
++
++static void cpuif_tx_scan(RTL8196ESoc *s)
++{
++    uint8_t *frame = g_malloc(65536);
++    int r;
++
++    for (r = 0; r < 4; r++) {
++        uint32_t base = s->tpdcr[r];
++        bool sent = false;
++
++        if (base == 0) {
++            continue;
++        }
++        for (;;) {
++            uint32_t entry = dma_rd32(s, guest_pa(base) + 4 * s->tx_cur[r]);
++            uint32_t pkthdr, mbuf;
++            size_t total = 0;
++            int hops = 0;
++
++            if (!(entry & 1)) {
++                break;
++            }
++            pkthdr = guest_pa(entry & ~3u);
++            mbuf = guest_pa(dma_rd32(s, pkthdr + PH_MBUF));
++            while (mbuf && hops++ < 64 && total < 65000) {
++                uint16_t mlen = dma_rd16(s, mbuf + MB_LEN);
++                uint32_t mdata = guest_pa(dma_rd32(s, mbuf + MB_DATA));
++                uint8_t mflags;
++
++                if (mlen > 65000 - total) {
++                    mlen = 65000 - total;
++                }
++                address_space_read(&address_space_memory, mdata,
++                                   MEMTXATTRS_UNSPECIFIED,
++                                   frame + total, mlen);
++                total += mlen;
++                mflags = 0;
++                address_space_read(&address_space_memory, mbuf + MB_FLAGS,
++                                   MEMTXATTRS_UNSPECIFIED, &mflags, 1);
++                if (mflags & MBUF_EOR) {
++                    break;
++                }
++                mbuf = guest_pa(dma_rd32(s, mbuf + MB_NEXT));
++            }
++            if (s->nic && total >= 14) {
++                qemu_send_packet(&s->nic->ncs[0], frame, total);
++            }
++            s->nic_tx_sent++;
++            sent = true;
++            dma_wr32(s, guest_pa(base) + 4 * s->tx_cur[r], entry & ~1u);
++            s->tx_cur[r] = (entry & 2) ? 0 : s->tx_cur[r] + 1;
++            s->cpuiisr |= CPUIISR_TX_DONE(r);
++        }
++        if (sent) {
++            s->cpuiisr |= CPUIISR_TX_ALL_DONE(r);
++        }
++    }
++    g_free(frame);
++}
++
++static uint64_t cpuif_read(void *opaque, hwaddr offset, unsigned size)
++{
++    RTL8196ESoc *s = opaque;
++    uint64_t r;
++
++    switch (offset) {
++    case 0x00:
++        return s->cpuicr;
++    case 0x04: case 0x08: case 0x0c: case 0x10: case 0x14: case 0x18:
++        return s->rpdcr[(offset - 0x04) / 4];
++    case 0x1c:
++        return s->rmdcr;
++    case 0x20:
++        return s->tpdcr[0];
++    case 0x24:
++        return s->tpdcr[1];
++    case 0x28:
++        return s->cpuiimr;
++    case 0x2c:
++        return s->cpuiisr;
++    case 0x30: case 0x34: case 0x38:
++        return s->cpuqdm[(offset - 0x30) / 4];
++    case 0x60:
++        r = s->tpdcr[2];
++        break;
++    case 0x64:
++        r = s->tpdcr[3];
++        break;
++    default:
++        r = 0;
++        break;
++    }
++    return r;
++}
++
++static void cpuif_write(void *opaque, hwaddr offset, uint64_t value,
++                        unsigned size)
++{
++    RTL8196ESoc *s = opaque;
++    uint32_t v = value;
++
++    switch (offset) {
++    case 0x00: /* CPUICR */
++        s->cpuicr = v;
++        if (v & CPUICR_SOFTRST) {
++            memset(s->rx_cur, 0, sizeof(s->rx_cur));
++            memset(s->tx_cur, 0, sizeof(s->tx_cur));
++            s->mbuf_cur = 0;
++            s->cpuicr &= ~CPUICR_SOFTRST;
++        }
++        if (v & CPUICR_TXFD) {
++            cpuif_tx_scan(s);
++            s->cpuicr &= ~CPUICR_TXFD;
++            cpuif_update_irq(s);
++        }
++        break;
++    case 0x04: case 0x08: case 0x0c: case 0x10: case 0x14: case 0x18:
++        s->rpdcr[(offset - 0x04) / 4] = v;
++        s->rx_cur[(offset - 0x04) / 4] = 0;
++        break;
++    case 0x1c:
++        s->rmdcr = v;
++        s->mbuf_cur = 0;
++        break;
++    case 0x20:
++        s->tpdcr[0] = v;
++        s->tx_cur[0] = 0;
++        break;
++    case 0x24:
++        s->tpdcr[1] = v;
++        s->tx_cur[1] = 0;
++        break;
++    case 0x28: /* CPUIIMR */
++        s->cpuiimr = v;
++        cpuif_update_irq(s);
++        break;
++    case 0x2c: /* CPUIISR: write-1-to-clear */
++        s->cpuiisr &= ~v;
++        cpuif_update_irq(s);
++        break;
++    case 0x30: case 0x34: case 0x38:
++        s->cpuqdm[(offset - 0x30) / 4] = v;
++        break;
++    case 0x60:
++        s->tpdcr[2] = v;
++        s->tx_cur[2] = 0;
++        break;
++    case 0x64:
++        s->tpdcr[3] = v;
++        s->tx_cur[3] = 0;
++        break;
++    default:
++        break;
++    }
++}
++
++static const MemoryRegionOps cpuif_ops = {
++    .read = cpuif_read,
++    .write = cpuif_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static NetClientInfo cpuif_net_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = cpuif_can_receive,
++    .receive = cpuif_receive,
++};
++
++/* ---- timers ---- */
++
++static uint32_t tc_data(RTL8196ESoc *s, int i)
++{
++    return s->regs[(REG_TC0DATA + 4 * i) / 4];
++}
++
++static bool tc_en(RTL8196ESoc *s, int i)
++{
++    return (s->regs[REG_TCCNR / 4] >> (31 - 2 * i)) & 1;
++}
++
++static bool tc_mode_periodic(RTL8196ESoc *s, int i)
++{
++    return (s->regs[REG_TCCNR / 4] >> (30 - 2 * i)) & 1;
++}
++
++static bool tc_ie(RTL8196ESoc *s, int i)
++{
++    return (s->regs[REG_TCIR / 4] >> (31 - i)) & 1;
++}
++
++static uint64_t tc_tick_ns(RTL8196ESoc *s)
++{
++    uint32_t div = s->regs[REG_CDBR / 4] >> 16;
++
++    if (div == 0) {
++        div = 1;
++    }
++    return (uint64_t)div * 80; /* 12.5 MHz input clock: the guest
++     * programs CDBR/DATA for a 10 ms tick as 8929 ticks x div 14
++     * (~125000 counts), which is 12.5 MHz, not 200 MHz - at div*5
++     * guest time ran 16x fast and busybox login's 60 s alarm fired
++     * in ~3.8 wall seconds, breaking the 0.1 installer's telnet
++     * login cadence (measured on the bench 2026-11-11). */
++}
++
++static uint64_t tc_period_ticks(RTL8196ESoc *s, int i)
++{
++    return (uint64_t)(tc_data(s, i) >> 8) + 1;
++}
++
++static uint64_t tc_period_ns(RTL8196ESoc *s, int i)
++{
++    return tc_period_ticks(s, i) * tc_tick_ns(s);
++}
++
++static void tc_update_line(RTL8196ESoc *s, int i)
++{
++    bool ip = (s->regs[REG_TCIR / 4] >> (29 - i)) & 1;
++    int level = (ip && tc_ie(s, i)) ? 1 : 0;
++
++    s->src_level = deposit32(s->src_level, RTL_IRQ_TC0 + i, 1, level);
++    rtl_soc_update_irq(s);
++}
++
++static uint32_t tc_cnt_read(RTL8196ESoc *s, int i)
++{
++    uint64_t elapsed, ticks;
++
++    if (!tc_en(s, i)) {
++        return s->tc_frozen_cnt[i];
++    }
++    if (s->tc_expired[i]) {
++        return tc_data(s, i);
++    }
++    elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->tc_start_ns[i];
++    ticks = elapsed / tc_tick_ns(s);
++    if (ticks >= tc_period_ticks(s, i)) {
++        ticks = tc_period_ticks(s, i) - 1;
++    }
++    return (uint32_t)(ticks << 8);
++}
++
++typedef struct TCExpireCtx {
++    RTL8196ESoc *s;
++    int idx;
++} TCExpireCtx;
++
++static TCExpireCtx tc_ctx[2];
++
++static void tc_expire_cb(void *opaque)
++{
++    TCExpireCtx *ctx = opaque;
++    RTL8196ESoc *s = ctx->s;
++    int i = ctx->idx;
++    uint64_t period = tc_period_ns(s, i);
++
++    s->regs[REG_TCIR / 4] |= (i == 0 ? TC0IP : TC1IP);
++    if (tc_mode_periodic(s, i) && period > 0) {
++        s->tc_start_ns[i] += period;
++        if (s->tc_start_ns[i] + period <=
++            (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
++            s->tc_start_ns[i] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        }
++        timer_mod(s->tc_timer[i], s->tc_start_ns[i] + period);
++    } else {
++        s->tc_expired[i] = true;
++    }
++    tc_update_line(s, i);
++}
++
++static void tc_start(RTL8196ESoc *s, int i)
++{
++    uint64_t period = tc_period_ns(s, i);
++
++    s->tc_start_ns[i] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->tc_expired[i] = false;
++    if (period > 0) {
++        timer_mod(s->tc_timer[i], s->tc_start_ns[i] + period);
++    }
++}
++
++static void tc_stop(RTL8196ESoc *s, int i)
++{
++    s->tc_frozen_cnt[i] = tc_cnt_read(s, i);
++    timer_del(s->tc_timer[i]);
++}
++
++/* ---- watchdog ---- */
++
++static void wdt_expire(void *opaque)
++{
++    RTL8196ESoc *s = opaque;
++
++    s->wdt_armed = false;
++    pending_reset_cause = RESET_CAUSE_WDT;
++    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++}
++
++static void wdt_write(RTL8196ESoc *s, uint32_t value)
++{
++    if (value == 0) {
++        /* the kernel fault path: write 0 to force a watchdog reset */
++        timer_mod(s->wdt_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++        s->wdt_armed = true;
++    } else if (value & WDT_KICK_BIT) {
++        timer_mod(s->wdt_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + WDT_PERIOD_NS);
++        s->wdt_armed = true;
++    }
++}
++
++/* ---- SPI flash engine ----
++ *
++ * Byte-stream model of the controller in spi_common.c/spi_cmd.c:
++ * SFCSR bits 31:30 != 0b11 select the chip (01 = chip 0, the hub's
++ * only flash); the LEN field (bits 29:28) is bytes-1 per SFDR access;
++ * SFDR moves data MSB-first. RDY (bit 27) reads 1: transfers complete
++ * synchronously. JEDEC ID answers as the hub's actual chip, the
++ * GigaDevice GD25Q64 (C8 40 17), measured in Camille's hardware
++ * boot log 2026-11-11 -- the bootcode and the kernel SPI driver
++ * both name the chip from this answer, so the bench prints
++ * GD25Q64 like the silicon. (Was the Winbond W25Q64 entry,
++ * EF 40 17; same capacity byte, cosmetic delta only.)
++ */
++
++#define SFCSR_RDY       (1u << 27)
++#define SPI_JEDEC0      0xc8
++#define SPI_JEDEC1      0x40
++#define SPI_JEDEC2      0x17 /* SIZE2N_08MB */
++
++static void spi_sync_xip(RTL8196ESoc *s, uint32_t addr, uint32_t len)
++{
++    uint8_t *xip = memory_region_get_ram_ptr(&s->xip);
++
++    if (addr < RTL_FLASH_SIZE) {
++        if (addr + len > RTL_FLASH_SIZE) {
++            len = RTL_FLASH_SIZE - addr;
++        }
++        memcpy(xip + addr, s->flash + addr, len);
++    }
++}
++
++static void spi_erase(RTL8196ESoc *s, uint32_t addr, uint32_t len)
++{
++    if (addr >= RTL_FLASH_SIZE) {
++        return;
++    }
++    if (addr + len > RTL_FLASH_SIZE) {
++        len = RTL_FLASH_SIZE - addr;
++    }
++    memset(s->flash + addr, 0xff, len);
++    spi_sync_xip(s, addr, len);
++    s->spi_op_done = true;
++}
++
++/* clock one byte through the flash; returns the byte shifted in */
++static uint8_t spi_clock(RTL8196ESoc *s, uint8_t out)
++{
++    static const uint8_t jedec[3] = { SPI_JEDEC0, SPI_JEDEC1, SPI_JEDEC2 };
++
++    if (!s->spi_cs_active || !s->spi_chip_present) {
++        return 0xff;
++    }
++    if (s->spi_phase == 0) {
++        s->spi_cmd = out;
++        s->spi_count = 0;
++        s->spi_addr = 0;
++        switch (out) {
++        case 0x06: /* WREN */
++            if (!s->spi_powerdown) {
++                s->spi_wel = true;
++            }
++            s->spi_phase = 3;
++            break;
++        case 0x04: /* WRDI */
++            s->spi_wel = false;
++            s->spi_phase = 3;
++            break;
++        case 0xb9: /* DP */
++            s->spi_powerdown = true;
++            s->spi_phase = 3;
++            break;
++        case 0xab: /* RDP / RES */
++            s->spi_powerdown = false;
++            s->spi_phase = 3;
++            break;
++        case 0x60: /* CE */
++        case 0xc7:
++            if (s->spi_wel && !s->spi_powerdown) {
++                spi_erase(s, 0, RTL_FLASH_SIZE);
++            }
++            s->spi_phase = 3;
++            break;
++        case 0x03: /* READ */
++        case 0x02: /* PP */
++        case 0x20: /* SE */
++        case 0xd8: /* BE */
++            s->spi_phase = s->spi_powerdown ? 3 : 1;
++            break;
++        case 0x0b: /* FASTREAD: one dummy byte after the address */
++            s->spi_phase = s->spi_powerdown ? 3 : 1;
++            break;
++        default: /* RDID, RDSR, WRSR and anything else: data phase */
++            s->spi_phase = 3;
++            break;
++        }
++        return 0xff;
++    }
++    if (s->spi_phase == 1) { /* address, MSB first */
++        s->spi_addr = (s->spi_addr << 8) | out;
++        if (++s->spi_count == 3) {
++            s->spi_count = 0;
++            s->spi_page_base = s->spi_addr & ~0xffu;
++            if (s->spi_cmd == 0x0b) {
++                s->spi_phase = 2;
++            } else {
++                if (s->spi_wel && s->spi_cmd == 0x20) {
++                    spi_erase(s, s->spi_addr & ~0xfffu, 0x1000);
++                } else if (s->spi_wel && s->spi_cmd == 0xd8) {
++                    spi_erase(s, s->spi_addr & ~0xffffu, 0x10000);
++                }
++                s->spi_phase = 3;
++            }
++        }
++        return 0xff;
++    }
++    if (s->spi_phase == 2) { /* dummy */
++        s->spi_phase = 3;
++        return 0xff;
++    }
++    /* data phase */
++    s->spi_count++;
++    if (s->spi_powerdown) {
++        return 0xff;
++    }
++    switch (s->spi_cmd) {
++    case 0x9f: /* RDID */
++        return s->spi_count <= 3 ? jedec[s->spi_count - 1] : 0;
++    case 0x05: /* RDSR: WIP always 0, transfers are synchronous */
++        return s->spi_status | (s->spi_wel ? 0x02 : 0);
++    case 0x01: /* WRSR */
++        if (s->spi_count == 1) {
++            s->spi_status = out & 0xfc;
++        }
++        return 0xff;
++    case 0x03: /* READ */
++    case 0x0b: /* FASTREAD */
++        return s->flash[s->spi_addr++ & (RTL_FLASH_SIZE - 1)];
++    case 0x02: /* PP: programming only clears bits; wraps in page */
++        if (s->spi_wel) {
++            uint32_t a = s->spi_addr & (RTL_FLASH_SIZE - 1);
++
++            s->flash[a] &= out;
++            spi_sync_xip(s, a, 1);
++            s->spi_op_done = true;
++            s->spi_addr = s->spi_page_base |
++                          ((s->spi_addr + 1) & 0xff);
++        }
++        return 0xff;
++    default:
++        return 0xff;
++    }
++}
++
++static uint32_t spi_sfdr_read(RTL8196ESoc *s)
++{
++    int n = ((s->sfcsr >> 28) & 3) + 1;
++    uint32_t word = 0;
++    int i;
++
++    for (i = 0; i < n; i++) {
++        word |= (uint32_t)spi_clock(s, 0) << (24 - 8 * i);
++    }
++    return word;
++}
++
++static void spi_sfdr_write(RTL8196ESoc *s, uint32_t value)
++{
++    int n = ((s->sfcsr >> 28) & 3) + 1;
++    int i;
++
++    for (i = 0; i < n; i++) {
++        spi_clock(s, (value >> (24 - 8 * i)) & 0xff);
++    }
++}
++
++static void spi_sfcsr_write(RTL8196ESoc *s, uint32_t value)
++{
++    bool was = s->spi_cs_active;
++    bool now = ((value >> 30) & 3) != 3;
++
++    s->sfcsr = value;
++    s->spi_cs_active = now;
++    s->spi_chip_present = ((value >> 30) & 3) == 1;
++    if (now && !was) {
++        s->spi_phase = 0;
++        s->spi_count = 0;
++        s->spi_op_done = false;
++    } else if (!now && was && s->spi_op_done) {
++        s->spi_wel = false; /* WEL drops at the end of program/erase */
++        s->spi_op_done = false;
++        s->flash_dirty = true; /* a write the file must learn about */
++    }
++}
++
++/* ---- flash write-back ----
++ *
++ * The bench loads the flash image into RAM at realize and the SPI
++ * engine mutates that array. Real silicon persists those writes,
++ * and the flashing flow depends on the persistence (write a bank,
++ * power-cycle, the bootcode must see the new bank marks), so the
++ * array is written back to its backing file: on a 2 s cadence
++ * while dirty, and at every device reset (which covers the
++ * guest's reboot path). Added for the v35 virgin rehearsal
++ * 2026-11-11: before this, guest flash writes died with the QEMU
++ * process, and step 4's payload-verified flash silently
++ * evaporated on the power cycle. */
++static void flash_writeback(RTL8196ESoc *s)
++{
++    FILE *f;
++
++    if (!s->flash_dirty || !s->flash_file || !s->flash) {
++        return;
++    }
++    f = fopen(s->flash_file, "wb");
++    if (!f) {
++        fprintf(stderr, "FLASH-WRITEBACK FAILED: cannot open %s\n",
++                s->flash_file);
++        return;
++    }
++    if (fwrite(s->flash, 1, RTL_FLASH_SIZE, f) == RTL_FLASH_SIZE) {
++        s->flash_dirty = false;
++        fprintf(stderr, "FLASH-WRITEBACK %s (%d bytes)\n",
++                s->flash_file, RTL_FLASH_SIZE);
++    } else {
++        fprintf(stderr, "FLASH-WRITEBACK FAILED: short write on %s\n",
++                s->flash_file);
++    }
++    fclose(f);
++}
++
++static void flash_wb_timer_cb(void *opaque)
++{
++    RTL8196ESoc *s = opaque;
++
++    flash_writeback(s);
++    timer_mod(s->flash_wb_timer,
++              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 2000000000LL);
++}
++
++/* ---- register file ---- */
++
++static uint32_t rtl_soc_reg_read(RTL8196ESoc *s, hwaddr offset)
++{
++    switch (offset) {
++    case REG_REVR:
++        return CHIP_ID_8196E;
++    case REG_RESETCAUSE:
++        return s->reset_cause;
++    case REG_STRAP:
++        return 0; /* low nibble must not be 0xd */
++    case REG_GIMR:
++        return s->gimr;
++    case REG_GISR:
++        return s->src_level;
++    case REG_IRR0:
++    case REG_IRR0 + 4:
++    case REG_IRR0 + 8:
++    case REG_IRR0 + 12:
++        return s->irr[(offset - REG_IRR0) / 4];
++    case REG_TC0CNT:
++        return tc_cnt_read(s, 0);
++    case REG_TC1CNT:
++        return tc_cnt_read(s, 1);
++    case REG_TCIR:
++        return s->regs[REG_TCIR / 4] & (TC0IE | TC1IE |
++                                        TC0IP | TC1IP);
++    case REG_SFCSR:
++        return s->sfcsr | SFCSR_RDY; /* transfers complete synchronously */
++    case REG_SFDR: {
++        uint32_t v = spi_sfdr_read(s);
++
++        if (s->spi_log) {
++            qemu_log("rtl8196e-spi: SFDR -> 0x%08x (cmd 0x%02x addr "
++                     "0x%06x phase %d)\n", v, s->spi_cmd, s->spi_addr,
++                     s->spi_phase);
++        }
++        return v;
++    }
++    default:
++{}        return s->regs[offset / 4];
++    }
++}
++
++static void rtl_soc_reg_write(RTL8196ESoc *s, hwaddr offset, uint32_t value)
++{
++    if (s->spi_log && offset >= 0x3000 && offset < 0x3120) {
++        qemu_log("rtl8196e-soc: write 0x%" HWADDR_PRIx " <- 0x%08x\n",
++                 offset, value);
++    }
++    switch (offset) {
++    case REG_REVR:
++    case REG_RESETCAUSE:
++    case REG_STRAP:
++    case REG_GISR:
++    case REG_TC0CNT:
++    case REG_TC1CNT:
++        break; /* read-only */
++    case REG_GIMR:
++        s->gimr = value;
++        rtl_soc_update_irq(s);
++        break;
++    case REG_IRR0:
++    case REG_IRR0 + 4:
++    case REG_IRR0 + 8:
++    case REG_IRR0 + 12:
++        s->irr[(offset - REG_IRR0) / 4] = value;
++        rtl_soc_update_irq(s);
++        break;
++    case REG_TCCNR: {
++        uint32_t old = s->regs[REG_TCCNR / 4];
++
++        s->regs[REG_TCCNR / 4] = value;
++        for (int i = 0; i < 2; i++) {
++            bool was = (old >> (31 - 2 * i)) & 1;
++            bool now = (value >> (31 - 2 * i)) & 1;
++
++            if (now && !was) {
++                tc_start(s, i);
++            } else if (!now && was) {
++                tc_stop(s, i);
++            }
++        }
++        break;
++    }
++    case REG_TCIR: {
++        uint32_t cur = s->regs[REG_TCIR / 4];
++
++        /* IE bits are plain storage; IP bits are write-1-to-clear */
++        cur &= ~(TC0IE | TC1IE);
++        cur |= value & (TC0IE | TC1IE);
++        if (value & TC0IP) {
++            cur &= ~TC0IP;
++        }
++        if (value & TC1IP) {
++            cur &= ~TC1IP;
++        }
++        s->regs[REG_TCIR / 4] = cur;
++        tc_update_line(s, 0);
++        tc_update_line(s, 1);
++        break;
++    }
++    case REG_WDTCNR:
++        s->regs[offset / 4] = value;
++        wdt_write(s, value);
++        break;
++    case REG_SFCSR:
++        spi_sfcsr_write(s, value);
++        break;
++    case REG_SFDR:
++        if (s->spi_log) {
++            qemu_log("rtl8196e-spi: SFDR <- 0x%08x\n", value);
++        }
++        spi_sfdr_write(s, value);
++        break;
++    case REG_SFCR:
++        s->regs[offset / 4] = value;
++        if (s->spi_log) {
++            qemu_log("rtl8196e-spi: SFCR <- 0x%08x\n", value);
++        }
++        break;
++    default:
++{}        s->regs[offset / 4] = value;
++        break;
++    }
++}
++
++static uint64_t rtl_soc_read(void *opaque, hwaddr offset, unsigned size)
++{
++    RTL8196ESoc *s = opaque;
++    uint32_t word = rtl_soc_reg_read(s, offset & ~3u);
++
++    return (word >> ((offset & 3) * 8)) & ((size == 4) ? 0xffffffffu :
++           ((1u << (size * 8)) - 1));
++}
++
++static void rtl_soc_write(void *opaque, hwaddr offset, uint64_t value,
++                          unsigned size)
++{
++    RTL8196ESoc *s = opaque;
++
++    if (size == 4 && (offset & 3) == 0) {
++        rtl_soc_reg_write(s, offset, (uint32_t)value);
++        return;
++    }
++    /* byte/halfword writes: read-modify-write the containing word */
++    uint32_t word = rtl_soc_reg_read(s, offset & ~3u);
++    int shift = (offset & 3) * 8;
++    uint32_t mask = (size == 4) ? 0xffffffffu :
++                    (((1u << (size * 8)) - 1) << shift);
++
++    word = (word & ~mask) | (((uint32_t)value << shift) & mask);
++    rtl_soc_reg_write(s, offset & ~3u, word);
++}
++
++static const MemoryRegionOps rtl_soc_ops = {
++    .read = rtl_soc_read,
++    .write = rtl_soc_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++};
++
++/* ---- SWCORE window ----
++ *
++ * Plain storage for the switch register file, except SWTCR0
++ * (SWCORE + 0x4418, rtl865xc_asicregs.h): bit 19 STOP_TLU_STA is a
++ * read-only status that reports the table-lookup engine stopped
++ * once software sets bit 18 STOP_TLU. The model executes the stop
++ * synchronously, so the status mirrors the command bit.
++ */
++
++#define SWCORE_SWTCR0   0x4418
++#define SWTCR0_STOP_TLU (1u << 18)
++#define SWTCR0_STOP_STA (1u << 19)
++
++static uint64_t rtl_swcore_read(void *opaque, hwaddr offset, unsigned size)
++{
++    RTL8196ESoc *s = opaque;
++    uint32_t word;
++
++    memcpy(&word, s->swcore_mem + (offset & ~3u), 4);
++    word = be32_to_cpu(word);
++    if ((offset & ~3u) == SWCORE_SWTCR0) {
++        if (word & SWTCR0_STOP_TLU) {
++            word |= SWTCR0_STOP_STA;
++        } else {
++            word &= ~SWTCR0_STOP_STA;
++        }
++    }
++    return (word >> ((offset & 3) * 8)) &
++           ((size == 4) ? 0xffffffffu : ((1u << (size * 8)) - 1));
++}
++
++static uint32_t swcore_word(RTL8196ESoc *s, hwaddr offset)
++{
++    uint32_t word;
++
++    memcpy(&word, s->swcore_mem + offset, 4);
++    return be32_to_cpu(word);
++}
++
++static void swcore_store(RTL8196ESoc *s, hwaddr offset, uint32_t value)
++{
++    uint32_t word = cpu_to_be32(value);
++
++    memcpy(s->swcore_mem + offset, &word, 4);
++}
++
++/*
++ * TACI table-access engine (SWCORE + 0x4d00, rtl865xc_asicregs.h):
++ * SWTACR bit 0 is ACTION (1 = start, self-clears to DONE), bits
++ * 3:1 the command (ADD/MODIFY/FORCE write the entry held in
++ * TCR0..7 into the table SRAM at SWTAA; command 0 reads it back).
++ * SWTASR bit 0 reports TABSTS (0 = success). The model executes
++ * synchronously, as the ASIC does within a poll or two.
++ */
++#define SWCORE_SWTACR   0x4d00
++#define SWCORE_SWTASR   0x4d04
++#define SWCORE_SWTAA    0x4d08
++#define SWCORE_TCR0     0x4d20
++
++static void swtacr_write(RTL8196ESoc *s, uint32_t value)
++{
++    if (value & 1) {
++        uint32_t addr = swcore_word(s, SWCORE_SWTAA);
++        uint32_t off = addr & (RTL_SWTBL_SIZE - 1);
++        uint8_t *sram = memory_region_get_ram_ptr(&s->swtbl);
++        int i;
++
++        if (off + 32 <= RTL_SWTBL_SIZE) {
++            for (i = 0; i < 8; i++) {
++                uint32_t tcr = swcore_word(s, SWCORE_TCR0 + 4 * i);
++
++                if ((value >> 1) & 7) { /* write command: TCR -> SRAM */
++                    uint32_t be = cpu_to_be32(tcr);
++
++                    memcpy(sram + off + 4 * i, &be, 4);
++                } else { /* read command: SRAM -> TCR */
++                    uint32_t be;
++
++                    memcpy(&be, sram + off + 4 * i, 4);
++                    swcore_store(s, SWCORE_TCR0 + 4 * i, be32_to_cpu(be));
++                }
++            }
++        }
++        swcore_store(s, SWCORE_SWTASR, 0); /* TABSTS_SUCCESS */
++        value &= ~1u; /* ACTION_DONE */
++    }
++    swcore_store(s, SWCORE_SWTACR, value);
++}
++
++static void rtl_swcore_write(void *opaque, hwaddr offset, uint64_t value,
++                             unsigned size)
++{
++    RTL8196ESoc *s = opaque;
++    uint32_t word;
++    int shift = (offset & 3) * 8;
++    uint32_t mask = (size == 4) ? 0xffffffffu :
++                    (((1u << (size * 8)) - 1) << shift);
++
++    memcpy(&word, s->swcore_mem + (offset & ~3u), 4);
++    word = be32_to_cpu(word);
++    word = (word & ~mask) | (((uint32_t)value << shift) & mask);
++    if ((offset & ~3u) == SWCORE_SWTACR && size == 4) {
++        swtacr_write(s, word);
++        return;
++    }
++    word = cpu_to_be32(word);
++    memcpy(s->swcore_mem + (offset & ~3u), &word, 4);
++}
++
++static const MemoryRegionOps rtl_swcore_ops = {
++    .read = rtl_swcore_read,
++    .write = rtl_swcore_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++};
++
++/* ---- device lifecycle ---- */
++
++static void rtl_soc_reset_hold(Object *obj)
++{
++    RTL8196ESoc *s = RTL8196E_SOC(obj);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    /* GPIO block reset state, measured on silicon at the monitor
++     * (DW B8003504, Camille 2026-11-11): 3504=0, 3508=FF000000,
++     * 350C=0000007C, 3510=0. The bootcode never writes 3508/350C/
++     * 3510, so monitor-time values are the reset values. 350C bit5
++     * matters: the bootcode's button check (0x80408B10) returns
++     * "pressed" when bit5 is CLEAR (its jr delay slot inverts) --
++     * with 350C left at 0, every long image checksum polled the
++     * check, read a phantom button press, and aborted validation
++     * for both banks, so a power-on boot always fell into the
++     * monitor. The pin idles high (pulled-up button input). */
++    flash_writeback(s); /* a reboot must boot what was written */
++    s->regs[0x3508 / 4] = 0xff000000;
++    s->regs[0x350c / 4] = 0x0000007c;
++    s->gimr = 0;
++    memset(s->irr, 0, sizeof(s->irr));
++    s->src_level = 0;
++    s->ip_sent = 0;
++    s->reset_cause = pending_reset_cause;
++    pending_reset_cause = 0;
++    s->tc_expired[0] = s->tc_expired[1] = false;
++    s->tc_frozen_cnt[0] = s->tc_frozen_cnt[1] = 0;
++    s->sfcsr = 0;
++    s->spi_cs_active = false;
++    s->spi_chip_present = false;
++    s->spi_op_done = false;
++    s->spi_phase = 0;
++    s->spi_count = 0;
++    s->spi_wel = false;
++    s->spi_status = 0;
++    s->spi_powerdown = false;
++    s->wdt_armed = false;
++    timer_del(s->tc_timer[0]);
++    timer_del(s->tc_timer[1]);
++    timer_del(s->wdt_timer);
++    rtl_soc_update_irq(s);
++}
++
++static void rtl_soc_realize(DeviceState *dev, Error **errp)
++{
++    RTL8196ESoc *s = RTL8196E_SOC(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++    g_autofree char *contents = NULL;
++    gsize len = 0;
++    int i;
++
++    if (!s->flash_file) {
++        error_setg(errp, "rtl8196e-soc: flash property is required");
++        return;
++    }
++    if (!g_file_get_contents(s->flash_file, &contents, &len, NULL)) {
++        error_setg(errp, "rtl8196e-soc: cannot read flash file %s",
++                   s->flash_file);
++        return;
++    }
++    if (len != RTL_FLASH_SIZE) {
++        error_setg(errp,
++                   "rtl8196e-soc: flash file %s is %zu bytes, expected %d",
++                   s->flash_file, len, RTL_FLASH_SIZE);
++        return;
++    }
++    s->flash = g_malloc(RTL_FLASH_SIZE);
++    memcpy(s->flash, contents, RTL_FLASH_SIZE);
++
++    memory_region_init_io(&s->mmio, OBJECT(dev), &rtl_soc_ops, s,
++                          "rtl8196e-soc.regs", RTL_SOC_SIZE);
++    sysbus_init_mmio(sbd, &s->mmio);
++
++    memory_region_init_ram(&s->xip, OBJECT(dev), "rtl8196e-soc.flash",
++                           RTL_FLASH_SIZE, &error_fatal);
++    memory_region_set_readonly(&s->xip, true);
++    /* the guest reads flash through this window; writes go through
++     * the SPI controller, which writes via this same host pointer */
++    memcpy(memory_region_get_ram_ptr(&s->xip), s->flash, RTL_FLASH_SIZE);
++    memory_region_add_subregion(get_system_memory(), RTL_XIP_BASE,
++                                &s->xip);
++    memory_region_init_alias(&s->xip_alias, OBJECT(dev),
++                             "rtl8196e-soc.flash-alias", &s->xip, 0,
++                             RTL_FLASH_SIZE);
++    memory_region_add_subregion(get_system_memory(), RTL_BOOT_ALIAS,
++                                &s->xip_alias);
++
++    memory_region_init_ram(&s->swtbl, OBJECT(dev), "rtl8196e-soc.swtbl",
++                           RTL_SWTBL_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), RTL_SWTBL_BASE,
++                                &s->swtbl);
++    s->swcore_mem = g_malloc0(RTL_SWCORE_SIZE);
++    memory_region_init_io(&s->swcore, OBJECT(dev), &rtl_swcore_ops, s,
++                          "rtl8196e-soc.swcore", RTL_SWCORE_SIZE);
++    memory_region_add_subregion(get_system_memory(), RTL_SWCORE_BASE,
++                                &s->swcore);
++
++    memory_region_init_io(&s->cpuif, OBJECT(dev), &cpuif_ops, s,
++                          "rtl8196e-soc.cpuif", RTL_CPUIF_SIZE);
++    memory_region_add_subregion(get_system_memory(), RTL_CPUIF_BASE,
++                                &s->cpuif);
++    if (s->conf.peers.ncs[0]) {
++        s->nic = qemu_new_nic(&cpuif_net_info, &s->conf,
++                              TYPE_RTL8196E_SOC, "rtl8196e-nic",
++                              &dev->mem_reentrancy_guard, s);
++        qemu_set_info_str(&s->nic->ncs[0], "model=rtl8196e-cpuif");
++    }
++
++    /*
++     * PCIe root-complex window (0x18B00000): present but inert.
++     * The stock kernel's WLAN/PCIe probe configures the RC and
++     * scans for a card; the hub has none, and storage reads of 0
++     * make the probe bail exactly as an empty slot does.
++     */
++    memory_region_init_ram(&s->pcie, OBJECT(dev), "rtl8196e-soc.pcie",
++                           0x100000, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), 0x18b00000,
++                                &s->pcie);
++
++    qdev_init_gpio_in_named(dev, rtl_soc_set_src, "src", 32);
++    for (i = 0; i < 16; i++) {
++        sysbus_init_irq(sbd, &s->ip_out[i]);
++    }
++    for (i = 0; i < 2; i++) {
++        tc_ctx[i].s = s;
++        tc_ctx[i].idx = i;
++        s->tc_timer[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc_expire_cb,
++                                      &tc_ctx[i]);
++    }
++    s->wdt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_expire, s);
++    s->flash_wb_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
++                                     flash_wb_timer_cb, s);
++    timer_mod(s->flash_wb_timer,
++              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 2000000000LL);
++}
++
++static Property rtl_soc_properties[] = {
++    DEFINE_PROP_STRING("flash", RTL8196ESoc, flash_file),
++    DEFINE_PROP_BOOL("spi-log", RTL8196ESoc, spi_log, false),
++    DEFINE_NIC_PROPERTIES(RTL8196ESoc, conf),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void rtl_soc_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->realize = rtl_soc_realize;
++    dc->desc = "RTL8196E SoC register blocks (Sengled bench)";
++    rc->phases.hold = rtl_soc_reset_hold;
++    device_class_set_props(dc, rtl_soc_properties);
++}
++
++static const TypeInfo rtl_soc_type_info = {
++    .name = TYPE_RTL8196E_SOC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(RTL8196ESoc),
++    .class_init = rtl_soc_class_init,
++};
++
++static void rtl_soc_register_types(void)
++{
++    type_register_static(&rtl_soc_type_info);
++}
++
++type_init(rtl_soc_register_types)
+diff -ruN a/qemu-8.2.2/include/hw/char/rtl8196e_uart.h b/qemu-8.2.2/include/hw/char/rtl8196e_uart.h
+--- a/qemu-8.2.2/include/hw/char/rtl8196e_uart.h	1969-12-31 19:00:00.000000000 -0500
++++ b/qemu-8.2.2/include/hw/char/rtl8196e_uart.h	2026-11-10 21:22:33.338250207 -0500
+@@ -0,0 +1,25 @@
++/*
++ * RTL8196E UART: a 16550A (QEMU serial core) behind the SoC's lane
++ * wiring. The kernel drives it with byte accesses at base + 4 * reg;
++ * the bootcode uses 32-bit accesses with the register value in the top
++ * byte lane (it shifts received words right by 0x18). Stock serial-mm
++ * cannot express that (it masks word writes to the low byte), so this
++ * wrapper translates access sizes explicitly.
++ */
++#ifndef HW_CHAR_RTL8196E_UART_H
++#define HW_CHAR_RTL8196E_UART_H
++
++#include "hw/char/serial.h"
++#include "qom/object.h"
++
++#define TYPE_RTL8196E_UART "rtl8196e-uart"
++OBJECT_DECLARE_SIMPLE_TYPE(RTL8196EUart, RTL8196E_UART)
++
++struct RTL8196EUart {
++    SysBusDevice parent_obj;
++
++    SerialState serial;
++    MemoryRegion mmio;
++};
++
++#endif
+diff -ruN a/qemu-8.2.2/include/hw/misc/rtl8196e_soc.h b/qemu-8.2.2/include/hw/misc/rtl8196e_soc.h
+--- a/qemu-8.2.2/include/hw/misc/rtl8196e_soc.h	1969-12-31 19:00:00.000000000 -0500
++++ b/qemu-8.2.2/include/hw/misc/rtl8196e_soc.h	2026-11-11 16:18:56.932022013 -0500
+@@ -0,0 +1,127 @@
++/*
++ * RTL8196E SoC block for the Sengled Z02-HUB emulation bench.
++ *
++ * Models the register blocks the vendor boot path touches: system
++ * control, SPI flash controller window, interrupt controller, timers,
++ * watchdog and GPIO. Register contracts are taken from the vendor
++ * kernel source (arch/mips rtl8196c platform.h, arch/rlx BSP names) and
++ * the decompiled bootcode; see ../../emulation-design.md in the bench
++ * repository root for the full inventory and evidence.
++ */
++#ifndef HW_MISC_RTL8196E_SOC_H
++#define HW_MISC_RTL8196E_SOC_H
++
++#include "qom/object.h"
++#include "exec/memory.h"
++#include "hw/irq.h"
++#include "hw/sysbus.h"
++#include "qemu/timer.h"
++#include "net/net.h"
++
++#define TYPE_RTL8196E_SOC "rtl8196e-soc"
++OBJECT_DECLARE_SIMPLE_TYPE(RTL8196ESoc, RTL8196E_SOC)
++
++/* SoC register aperture (physical 0x18000000) */
++#define RTL_SOC_BASE        0x18000000
++#define RTL_SOC_SIZE        0x3600
++
++/* Flash XIP aperture: flash byte X is visible at RTL_XIP_BASE + X.
++ * The bootcode forms read addresses as 0xB8000000 + 0x05000000 + X
++ * (phys 0x1d000000 + X); its chain segment bases 0x05010000,
++ * 0x05020000, 0x05030000 are the +0x10000 segment steps on top of
++ * that constant, not part of the aperture base. */
++#define RTL_XIP_BASE        0x1d000000
++#define RTL_BOOT_ALIAS      0x1fc00000
++#define RTL_FLASH_SIZE      0x800000 /* 8 MiB */
++
++/* Switch table / core apertures (storage only until the NIC lands) */
++#define RTL_SWTBL_BASE      0x1b000000
++#define RTL_SWTBL_SIZE      0x140000
++#define RTL_SWCORE_BASE     0x1b800000
++#define RTL_SWCORE_SIZE     0x10000
++
++/* CPU packet interface registers (CPUICR, ring bases, CPUIIMR/ISR);
++ * storage until the Phase 3 DMA engine lands */
++#define RTL_CPUIF_BASE      0x18010000
++#define RTL_CPUIF_SIZE      0x1000
++
++/* Interrupt source line numbers (= GIMR/GISR bit positions, from
++ * boards/rtl8196e/bsp/bspchip.h: BSP_*_IE / BSP_*_IP) */
++#define RTL_IRQ_TC0         8
++#define RTL_IRQ_TC1         9
++#define RTL_IRQ_UART0       12
++#define RTL_IRQ_UART1       13
++#define RTL_IRQ_SWCORE      15
++
++struct RTL8196ESoc {
++    SysBusDevice parent_obj;
++
++    MemoryRegion mmio;
++    MemoryRegion xip;
++    MemoryRegion xip_alias;
++    MemoryRegion swtbl;
++    MemoryRegion swcore;
++    uint8_t *swcore_mem; /* backing for the SWCORE window (MMIO ops) */
++    MemoryRegion cpuif;
++    MemoryRegion pcie;
++
++    /* CPU packet interface (Phase 3 DMA engine) */
++    NICState *nic;
++    NICConf conf;
++    uint32_t cpuicr;   /* CPUICR: TXCMD/RXCMD/TXFD/SOFTRST + fields */
++    uint32_t cpuiimr;  /* CPUIIMR */
++    uint32_t cpuiisr;  /* CPUIISR (write-1-to-clear from the guest) */
++    uint32_t rpdcr[6]; /* CPURPDCR0-5: Rx pkthdr ring bases */
++    uint32_t rmdcr;    /* CPURMDCR0: Rx mbuf ring base */
++    uint32_t tpdcr[4]; /* CPUTPDCR0-3: Tx pkthdr ring bases */
++    uint32_t cpuqdm[3];/* CPUQDM0-5 storage (16-bit regs, packed) */
++    uint32_t rx_cur[6];  /* ASIC-side Rx cursor per ring */
++    uint32_t tx_cur[4];  /* ASIC-side Tx cursor per ring */
++    uint32_t mbuf_cur;   /* ASIC-side Rx mbuf ring cursor */
++    uint32_t nic_rx_delivered;
++    uint32_t nic_rx_runout;
++    uint32_t nic_tx_sent;
++
++    uint32_t regs[RTL_SOC_SIZE / 4];
++    uint32_t reset_cause;
++    uint32_t gimr;
++    uint32_t irr[4];
++    uint32_t src_level; /* GISR reflection: bit per source line */
++    uint32_t ip_sent;   /* last levels driven onto ip_out */
++
++    qemu_irq src_in[32]; /* gpio-in handlers write here via src_level */
++    qemu_irq ip_out[16]; /* sysbus IRQs: CPU IP0..IP7, then LOPI0..7 */
++
++    /* timers */
++    QEMUTimer *tc_timer[2];
++    uint64_t tc_start_ns[2];
++    uint32_t tc_frozen_cnt[2];
++    bool tc_expired[2];
++
++    /* watchdog */
++    QEMUTimer *wdt_timer;
++    bool wdt_armed;
++
++    /* flash backing */
++    uint8_t *flash;
++    char *flash_file;
++    bool spi_log;
++    bool flash_dirty;   /* guest program/erase landed; write-back due */
++    QEMUTimer *flash_wb_timer;
++
++    /* SPI flash engine state (SFCSR/SFDR byte stream) */
++    uint32_t sfcsr;
++    bool spi_cs_active;
++    bool spi_chip_present; /* CS pattern 01 = chip 0; chip 1 is absent */
++    bool spi_op_done;   /* a program/erase ran in this transaction */
++    uint8_t spi_cmd;
++    uint32_t spi_addr;
++    uint32_t spi_page_base;
++    int spi_phase;      /* 0 cmd, 1 addr, 2 dummy, 3 data */
++    int spi_count;      /* bytes consumed in the current phase */
++    bool spi_wel;
++    uint8_t spi_status; /* stored status bits (SRWD/BP), WEL/WIP apart */
++    bool spi_powerdown;
++};
++
++#endif
+diff -ruN a/qemu-8.2.2/target/mips/cpu-defs.c.inc b/qemu-8.2.2/target/mips/cpu-defs.c.inc
+--- a/qemu-8.2.2/target/mips/cpu-defs.c.inc	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/cpu-defs.c.inc	2026-11-11 05:00:50.576412527 -0500
+@@ -76,6 +76,49 @@
+         .mmu_type = MMU_TYPE_R4000,
+     },
+     {
++        /*
++         * Lexra RLX4181 (Realtek RTL8196E core), for the Sengled
++         * bench. PrID from the vendor kernel's arch/rlx cpu.h
++         * (PRID_IMP_RLX4181 = 0xcd00, Lexra company field 0x0b).
++         * No FPU (Config1.FP = 0); the COP1X indexed load/store
++         * space is the core's cache/local-memory diagnostic path
++         * and does not raise CpU -- see INSN_RLX4181 handling in
++         * translate.c (OPC_CP3). MIPS16 is implemented.
++         * Cache geometry in Config1 is the 4Kc's; QEMU does not
++         * model the caches functionally and the vendor kernel
++         * takes its sizes from its BSP headers.
++         */
++        .name = "rlx4181",
++        .CP0_PRid = 0x0000cd01,
++        .CP0_Config0 = MIPS_CONFIG0 | (MMU_TYPE_R4000 << CP0C0_MT),
++        .CP0_Config1 = MIPS_CONFIG1 | (15 << CP0C1_MMU) |
++                       (0 << CP0C1_IS) | (3 << CP0C1_IL) | (1 << CP0C1_IA) |
++                       (0 << CP0C1_DS) | (3 << CP0C1_DL) | (1 << CP0C1_DA) |
++                       (0 << CP0C1_CA),
++        .CP0_Config2 = MIPS_CONFIG2,
++        .CP0_Config3 = MIPS_CONFIG3,
++        .CP0_LLAddr_rw_bitmask = 0,
++        .CP0_LLAddr_shift = 4,
++        .SYNCI_Step = 32,
++        .CCRes = 2,
++        /*
++         * The Lexra Status register carries the KU/IE stack in
++         * bits [5:0] and the vendor kernel's user flag (KU_USER,
++         * arch/rlx isadep.h) is the single bit 3 -- a slot the
++         * stock 4K masks (0x...FF17) leave read-only.  With bit 3
++         * dropped by every mtc0, a user task's saved frame never
++         * showed user mode, do_signal() early-returned on every
++         * pass, and the first pending signal livelocked the
++         * exception-return path.  All six stack bits are
++         * guest-writable on the real core.
++         */
++        .CP0_Status_rw_bitmask = 0x1278FF3F,
++        .SEGBITS = 32,
++        .PABITS = 32,
++        .insn_flags = CPU_MIPS32R1 | ASE_MIPS16 | INSN_RLX4181,
++        .mmu_type = MMU_TYPE_R4000,
++    },
++    {
+         .name = "4Km",
+         .CP0_PRid = 0x00018300,
+         /* Config1 implemented, fixed mapping MMU,
+diff -ruN a/qemu-8.2.2/target/mips/cpu.c b/qemu-8.2.2/target/mips/cpu.c
+--- a/qemu-8.2.2/target/mips/cpu.c	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/cpu.c	2026-11-11 02:08:34.614926131 -0500
+@@ -297,11 +297,23 @@
+     env->CP0_Wired = 0;
+     env->CP0_GlobalNumber = (cs->cpu_index & 0xFF) << CP0GN_VPId;
+     env->CP0_EBase = KSEG0_BASE | (cs->cpu_index & 0x3FF);
++    memset(env->CP0_LXReg, 0, sizeof(env->CP0_LXReg));
+     if (env->CP0_Config3 & (1 << CP0C3_CMGCR)) {
+         env->CP0_CMGCRBase = 0x1fbf8000 >> 4;
+     }
+     env->CP0_EntryHi_ASID_mask = (env->CP0_Config5 & (1 << CP0C5_MI)) ?
+             0x0 : (env->CP0_Config4 & (1 << CP0C4_AE)) ? 0x3ff : 0xff;
++    if (env->insn_flags & INSN_RLX4181) {
++        /*
++         * The RLX4181 keeps the ASID in EntryHi bits [11:6]
++         * (vendor kernel: ASID_MASK 0xfc0, ASID_INC 0x40 in
++         * arch/rlx/include/asm/mmu_context.h). The generic 0xff
++         * mask truncates the ASID to its low two bits, so every
++         * fourth mm (contexts 0x40, 0x140, 0x240, ...) aliases
++         * to the same TLB ASID and address spaces cross-match.
++         */
++        env->CP0_EntryHi_ASID_mask = 0xfc0;
++    }
+     env->CP0_Status = (1 << CP0St_BEV) | (1 << CP0St_ERL);
+     if (env->insn_flags & INSN_LOONGSON2F) {
+         /* Loongson-2F has those bits hardcoded to 1 */
+diff -ruN a/qemu-8.2.2/target/mips/cpu.h b/qemu-8.2.2/target/mips/cpu.h
+--- a/qemu-8.2.2/target/mips/cpu.h	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/cpu.h	2026-11-10 22:55:17.081273494 -0500
+@@ -831,6 +831,15 @@
+     int32_t CP0_PRid;
+     target_ulong CP0_EBase;
+     target_ulong CP0_EBaseWG_rw_bitmask;
++    /*
++     * Lexra LX coprocessor register file (RLX4181 only): index 0 is
++     * EStatus, 1 is ECause, 2 is IntVec; the vendor kernel reaches
++     * them with mflxc0/mtlxc0 (arch/rlx/include/asm/rlxregs.h).
++     * ECause bits 16..23 are a level reflection of the LOPI input
++     * lines, maintained by the LOPI irq handler.
++     */
++    uint32_t CP0_LXReg[32];
++    qemu_irq lx_irq[8];
+ #define CP0EBase_WG 11
+     target_ulong CP0_CMGCRBase;
+ /*
+@@ -1361,6 +1370,7 @@
+ /* HW declaration specific to the MIPS target */
+ void cpu_mips_soft_irq(CPUMIPSState *env, int irq, int level);
+ void cpu_mips_irq_init_cpu(MIPSCPU *cpu);
++void cpu_mips_lx_irq_init_cpu(MIPSCPU *cpu);
+ void cpu_mips_clock_init(MIPSCPU *cpu);
+ 
+ #endif /* !CONFIG_USER_ONLY */
+diff -ruN a/qemu-8.2.2/target/mips/internal.h b/qemu-8.2.2/target/mips/internal.h
+--- a/qemu-8.2.2/target/mips/internal.h	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/internal.h	2026-11-10 22:55:21.630273459 -0500
+@@ -204,9 +204,27 @@
+          */
+         r = (pending & status) != 0;
+     }
++    if (!r && (env->insn_flags & INSN_RLX4181)) {
++        /* Lexra LOPI: pending = ECause IP & EStatus IM (bits 16..23),
++         * delivered once the kernel has programmed IntVec. */
++        r = env->CP0_LXReg[2] != 0 &&
++            (env->CP0_LXReg[1] & env->CP0_LXReg[0] & 0x00ff0000) != 0;
++    }
+     return r;
+ }
+ 
++/* Lowest pending LOPI line (0..7), or -1 when none is deliverable. */
++static inline int mips_lx_lopi_line(CPUMIPSState *env)
++{
++    uint32_t pending;
++
++    if (!(env->insn_flags & INSN_RLX4181) || env->CP0_LXReg[2] == 0) {
++        return -1;
++    }
++    pending = (env->CP0_LXReg[1] & env->CP0_LXReg[0] & 0x00ff0000) >> 16;
++    return pending ? ctz32(pending) : -1;
++}
++
+ void msa_reset(CPUMIPSState *env);
+ 
+ /* cp0_timer.c */
+diff -ruN a/qemu-8.2.2/target/mips/mips-defs.h b/qemu-8.2.2/target/mips/mips-defs.h
+--- a/qemu-8.2.2/target/mips/mips-defs.h	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/mips-defs.h	2026-11-10 21:49:03.134233002 -0500
+@@ -43,6 +43,7 @@
+ #define INSN_LOONGSON2F   0x0000080000000000ULL
+ #define INSN_LOONGSON3A   0x0000100000000000ULL
+ #define INSN_OCTEON       0x0000200000000000ULL
++#define INSN_RLX4181      0x0000400000000000ULL
+ /*
+  *   bits 52-63: vendor-specific ASEs
+  */
+diff -ruN a/qemu-8.2.2/target/mips/tcg/sysemu/cp0_helper.c b/qemu-8.2.2/target/mips/tcg/sysemu/cp0_helper.c
+--- a/qemu-8.2.2/target/mips/tcg/sysemu/cp0_helper.c	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/tcg/sysemu/cp0_helper.c	2026-11-11 00:47:40.844221541 -0500
+@@ -1143,7 +1143,12 @@
+ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
+ {
+     target_ulong old, val, mask;
+-    mask = (TARGET_PAGE_MASK << 1) | env->CP0_EntryHi_ASID_mask;
++    if (env->insn_flags & INSN_RLX4181) {
++        /* Single-page TLB entries: EntryHi keeps VA bit 12. */
++        mask = TARGET_PAGE_MASK | env->CP0_EntryHi_ASID_mask;
++    } else {
++        mask = (TARGET_PAGE_MASK << 1) | env->CP0_EntryHi_ASID_mask;
++    }
+     if (((env->CP0_Config4 >> CP0C4_IE) & 0x3) >= 2) {
+         mask |= 1 << CP0EnHi_EHINV;
+     }
+diff -ruN a/qemu-8.2.2/target/mips/tcg/sysemu/special_helper.c b/qemu-8.2.2/target/mips/tcg/sysemu/special_helper.c
+--- a/qemu-8.2.2/target/mips/tcg/sysemu/special_helper.c	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/tcg/sysemu/special_helper.c	2026-11-10 23:59:13.101243942 -0500
+@@ -20,6 +20,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/log.h"
++#include "hw/irq.h"
+ #include "cpu.h"
+ #include "exec/helper-proto.h"
+ #include "exec/exec-all.h"
+@@ -116,6 +117,30 @@
+     debug_post_eret(env);
+ }
+ 
++/*
++ * Called after a guest mtlxc0 stored `val` into LX register `rd`:
++ * re-evaluate the Lexra LOPI pending state -- a line that was
++ * already high becomes deliverable the moment the kernel unmasks
++ * it in EStatus or programs IntVec, with no further line change
++ * to notice.
++ */
++void helper_lx_irq_update(CPUMIPSState *env, target_ulong val, uint32_t rd)
++{
++    int i;
++
++    (void)val;
++    (void)rd;
++    /*
++     * Re-drive the LOPI input lines from the ECause reflection;
++     * the line handler (which takes the iothread lock) then
++     * re-evaluates deliverability against the new EStatus/IntVec.
++     * cpu_interrupt() cannot be called from a TCG helper here.
++     */
++    for (i = 0; i < 8; i++) {
++        qemu_set_irq(env->lx_irq[i], (env->CP0_LXReg[1] >> (16 + i)) & 1);
++    }
++}
++
+ void helper_eret(CPUMIPSState *env)
+ {
+     exception_return(env);
+diff -ruN a/qemu-8.2.2/target/mips/tcg/sysemu/tlb_helper.c b/qemu-8.2.2/target/mips/tcg/sysemu/tlb_helper.c
+--- a/qemu-8.2.2/target/mips/tcg/sysemu/tlb_helper.c	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/tcg/sysemu/tlb_helper.c	2026-11-11 08:27:57.737445349 -0500
+@@ -26,6 +26,23 @@
+ #include "exec/log.h"
+ #include "exec/helper-proto.h"
+ 
++/*
++ * Bench diagnostics (rlx-syscall biography, rlx-storm detector)
++ * are opt-in: without RLX_TRACE in the environment they must be
++ * completely silent -- an ungated qemu_log on every syscall
++ * floods stderr and once froze a guest by back-pressure on an
++ * undrained pty (phase-3 investigation, 2026-11-11).
++ */
++static bool rlx_trace_on(void)
++{
++    static int on = -1;
++
++    if (on < 0) {
++        on = getenv("RLX_TRACE") != NULL;
++    }
++    return on;
++}
++
+ /* TLB management */
+ static void r4k_mips_tlb_flush_extra(CPUMIPSState *env, int first)
+ {
+@@ -52,31 +69,73 @@
+ 
+     /* XXX: detect conflicting TLBs and raise a MCHECK exception when needed */
+     tlb = &env->tlb->mmu.r4k.tlb[idx];
+-    if (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) {
++    if (env->insn_flags & INSN_RLX4181) {
++        /*
++         * The RLX4181 has no EHINV: EntryHi bit 10 is the top bit
++         * of the ASID field [11:6]. Reading it as EHINV discards
++         * every fill for mms whose context has that bit set
++         * (contexts 0x400-0x7c0, 0xc00-0xfc0, ...) and the refill
++         * handler loops forever on the first fault in such an mm.
++         */
++        tlb->EHINV = 0;
++    } else if (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) {
+         tlb->EHINV = 1;
+         return;
++    } else {
++        tlb->EHINV = 0;
++    }
++    if (env->insn_flags & INSN_RLX4181) {
++        /*
++         * The Lexra RLX4181 TLB is R3000-style: one page per entry,
++         * tagged by the full VPN (EntryHi bit 12 is significant),
++         * data from EntryLo0 alone -- the vendor kernel's refill
++         * and TLB-change handlers load a single PTE into EntryLo0
++         * and never touch EntryLo1 (arch/rlx/mm/tlbex.c). The
++         * EntryLo layout is the R3000 one (arch/rlx/include/asm/
++         * pgtable-bits.h): PFN at [31:12], uncached at bit 11,
++         * dirty bit 10, valid bit 9, global bit 8.
++         */
++        tlb->VPN = env->CP0_EntryHi & TARGET_PAGE_MASK;
++    } else {
++        tlb->VPN = env->CP0_EntryHi & (TARGET_PAGE_MASK << 1);
+     }
+-    tlb->EHINV = 0;
+-    tlb->VPN = env->CP0_EntryHi & (TARGET_PAGE_MASK << 1);
+ #if defined(TARGET_MIPS64)
+     tlb->VPN &= env->SEGMask;
+ #endif
+     tlb->ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+     tlb->MMID = env->CP0_MemoryMapID;
+     tlb->PageMask = env->CP0_PageMask;
++    if (env->insn_flags & INSN_RLX4181) {
++        tlb->G = (env->CP0_EntryLo0 >> 8) & 1;
++        tlb->V0 = (env->CP0_EntryLo0 >> 9) & 1;
++        tlb->D0 = (env->CP0_EntryLo0 >> 10) & 1;
++        tlb->C0 = (env->CP0_EntryLo0 & (1 << 11)) ? 2 : 3;
++        tlb->XI0 = 0;
++        tlb->RI0 = 0;
++        tlb->PFN[0] = (extract64(env->CP0_EntryLo0, 12, 20) & ~mask) << 12;
++        tlb->V1 = 0;
++        tlb->D1 = 0;
++        tlb->C1 = 0;
++        tlb->XI1 = 0;
++        tlb->RI1 = 0;
++        tlb->PFN[1] = 0;
++        return;
++    }
+     tlb->G = env->CP0_EntryLo0 & env->CP0_EntryLo1 & 1;
+     tlb->V0 = (env->CP0_EntryLo0 & 2) != 0;
+     tlb->D0 = (env->CP0_EntryLo0 & 4) != 0;
+     tlb->C0 = (env->CP0_EntryLo0 >> 3) & 0x7;
+     tlb->XI0 = (env->CP0_EntryLo0 >> CP0EnLo_XI) & 1;
+     tlb->RI0 = (env->CP0_EntryLo0 >> CP0EnLo_RI) & 1;
+-    tlb->PFN[0] = (get_tlb_pfn_from_entrylo(env->CP0_EntryLo0) & ~mask) << 12;
++    tlb->PFN[0] = (get_tlb_pfn_from_entrylo(env->CP0_EntryLo0) &
++                   ~mask) << 12;
+     tlb->V1 = (env->CP0_EntryLo1 & 2) != 0;
+     tlb->D1 = (env->CP0_EntryLo1 & 4) != 0;
+     tlb->C1 = (env->CP0_EntryLo1 >> 3) & 0x7;
+     tlb->XI1 = (env->CP0_EntryLo1 >> CP0EnLo_XI) & 1;
+     tlb->RI1 = (env->CP0_EntryLo1 >> CP0EnLo_RI) & 1;
+-    tlb->PFN[1] = (get_tlb_pfn_from_entrylo(env->CP0_EntryLo1) & ~mask) << 12;
++    tlb->PFN[1] = (get_tlb_pfn_from_entrylo(env->CP0_EntryLo1) &
++                   ~mask) << 12;
+ }
+ 
+ static void r4k_helper_tlbinv(CPUMIPSState *env)
+@@ -124,6 +183,21 @@
+ 
+     idx = (env->CP0_Index & ~0x80000000) % env->tlb->nb_tlb;
+     tlb = &env->tlb->mmu.r4k.tlb[idx];
++    if (env->insn_flags & INSN_RLX4181) {
++        /* R3000-style single-page entries; see r4k_fill_tlb. */
++        VPN = env->CP0_EntryHi & TARGET_PAGE_MASK;
++        EHINV = 0; /* no EHINV on RLX; bit 10 is ASID, see fill. */
++        G = (env->CP0_EntryLo0 >> 8) & 1;
++        V0 = (env->CP0_EntryLo0 >> 9) & 1;
++        D0 = (env->CP0_EntryLo0 >> 10) & 1;
++        XI0 = 0;
++        RI0 = 0;
++        V1 = 0;
++        D1 = 0;
++        XI1 = 0;
++        RI1 = 0;
++        goto have_vpn;
++    }
+     VPN = env->CP0_EntryHi & (TARGET_PAGE_MASK << 1);
+ #if defined(TARGET_MIPS64)
+     VPN &= env->SEGMask;
+@@ -138,6 +212,7 @@
+     D1 = (env->CP0_EntryLo1 & 4) != 0;
+     XI1 = (env->CP0_EntryLo1 >> CP0EnLo_XI) &1;
+     RI1 = (env->CP0_EntryLo1 >> CP0EnLo_RI) &1;
++have_vpn:
+ 
+     tlb_mmid = mi ? tlb->MMID : (uint32_t) tlb->ASID;
+     /*
+@@ -182,6 +257,9 @@
+         tlb = &env->tlb->mmu.r4k.tlb[i];
+         /* 1k pages are not supported. */
+         mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
++        if (env->insn_flags & INSN_RLX4181) {
++            mask = tlb->PageMask | ~TARGET_PAGE_MASK;
++        }
+         tag = env->CP0_EntryHi & ~mask;
+         VPN = tlb->VPN & ~mask;
+ #if defined(TARGET_MIPS64)
+@@ -201,6 +279,9 @@
+             tlb = &env->tlb->mmu.r4k.tlb[i];
+             /* 1k pages are not supported. */
+             mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
++            if (env->insn_flags & INSN_RLX4181) {
++                mask = tlb->PageMask | ~TARGET_PAGE_MASK;
++            }
+             tag = env->CP0_EntryHi & ~mask;
+             VPN = tlb->VPN & ~mask;
+ #if defined(TARGET_MIPS64)
+@@ -249,7 +330,7 @@
+ 
+     r4k_mips_tlb_flush_extra(env, env->tlb->nb_tlb);
+ 
+-    if (tlb->EHINV) {
++    if (tlb->EHINV && !(env->insn_flags & INSN_RLX4181)) {
+         env->CP0_EntryHi = 1 << CP0EnHi_EHINV;
+         env->CP0_PageMask = 0;
+         env->CP0_EntryLo0 = 0;
+@@ -258,14 +339,29 @@
+         env->CP0_EntryHi = mi ? tlb->VPN : tlb->VPN | tlb->ASID;
+         env->CP0_MemoryMapID = tlb->MMID;
+         env->CP0_PageMask = tlb->PageMask;
+-        env->CP0_EntryLo0 = tlb->G | (tlb->V0 << 1) | (tlb->D0 << 2) |
+-                        ((uint64_t)tlb->RI0 << CP0EnLo_RI) |
+-                        ((uint64_t)tlb->XI0 << CP0EnLo_XI) | (tlb->C0 << 3) |
+-                        get_entrylo_pfn_from_tlb(tlb->PFN[0] >> 12);
+-        env->CP0_EntryLo1 = tlb->G | (tlb->V1 << 1) | (tlb->D1 << 2) |
+-                        ((uint64_t)tlb->RI1 << CP0EnLo_RI) |
+-                        ((uint64_t)tlb->XI1 << CP0EnLo_XI) | (tlb->C1 << 3) |
+-                        get_entrylo_pfn_from_tlb(tlb->PFN[1] >> 12);
++        if (env->insn_flags & INSN_RLX4181) {
++            /*
++             * R3000-format readback: PFN at [31:12], uncached at
++             * bit 11, dirty bit 10, valid bit 9, global bit 8.
++             * EntryLo1 is unused on this core; read it back as 0.
++             */
++            env->CP0_EntryLo0 = (tlb->G << 8) | (tlb->V0 << 9) |
++                            (tlb->D0 << 10) |
++                            (tlb->C0 == 2 ? (1 << 11) : 0) |
++                            (tlb->PFN[0] & ~0xfffull);
++            env->CP0_EntryLo1 = 0;
++        } else {
++            env->CP0_EntryLo0 = tlb->G | (tlb->V0 << 1) | (tlb->D0 << 2) |
++                            ((uint64_t)tlb->RI0 << CP0EnLo_RI) |
++                            ((uint64_t)tlb->XI0 << CP0EnLo_XI) |
++                            (tlb->C0 << 3) |
++                            get_entrylo_pfn_from_tlb(tlb->PFN[0] >> 12);
++            env->CP0_EntryLo1 = tlb->G | (tlb->V1 << 1) | (tlb->D1 << 2) |
++                            ((uint64_t)tlb->RI1 << CP0EnLo_RI) |
++                            ((uint64_t)tlb->XI1 << CP0EnLo_XI) |
++                            (tlb->C1 << 3) |
++                            get_entrylo_pfn_from_tlb(tlb->PFN[1] >> 12);
++        }
+     }
+ }
+ 
+@@ -402,8 +498,14 @@
+         r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
+         /* 1k pages are not supported. */
+         target_ulong mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
+-        target_ulong tag = address & ~mask;
+-        target_ulong VPN = tlb->VPN & ~mask;
++        target_ulong tag;
++        target_ulong VPN;
++        if (env->insn_flags & INSN_RLX4181) {
++            /* Single-page entries: the tag keeps VA bit 12. */
++            mask = tlb->PageMask | ~TARGET_PAGE_MASK;
++        }
++        tag = address & ~mask;
++        VPN = tlb->VPN & ~mask;
+ #if defined(TARGET_MIPS64)
+         tag &= env->SEGMask;
+ #endif
+@@ -412,7 +514,8 @@
+         tlb_mmid = mi ? tlb->MMID : (uint32_t) tlb->ASID;
+         if ((tlb->G == 1 || tlb_mmid == MMID) && VPN == tag && !tlb->EHINV) {
+             /* TLB match */
+-            int n = !!(address & mask & ~(mask >> 1));
++            int n = (env->insn_flags & INSN_RLX4181) ? 0 :
++                !!(address & mask & ~(mask >> 1));
+             /* Check access rights */
+             if (!(n ? tlb->V1 : tlb->V0)) {
+                 return TLBRET_INVALID;
+@@ -424,7 +527,12 @@
+                 return TLBRET_RI;
+             }
+             if (access_type != MMU_DATA_STORE || (n ? tlb->D1 : tlb->D0)) {
+-                *physical = tlb->PFN[n] | (address & (mask >> 1));
++                if (env->insn_flags & INSN_RLX4181) {
++                    /* 4 KiB pages only on this core. */
++                    *physical = tlb->PFN[0] | (address & ~TARGET_PAGE_MASK);
++                } else {
++                    *physical = tlb->PFN[n] | (address & (mask >> 1));
++                }
+                 *prot = PAGE_READ;
+                 if (n ? tlb->D1 : tlb->D0) {
+                     *prot |= PAGE_WRITE;
+@@ -499,6 +607,23 @@
+     CPUState *cs = env_cpu(env);
+     int exception = 0, error_code = 0;
+ 
++    if (env->insn_flags & INSN_RLX4181 && address < 0x80000000) {
++        /* Bench diagnostic: surface exception storms per address. */
++        static target_ulong storm_addr;
++        static int storm_err, storm_run;
++        if (address == storm_addr && tlb_error == storm_err) {
++            if (++storm_run == 200 && rlx_trace_on()) {
++                qemu_log("rlx-storm: addr=0x%08x tlb_error=%d x200\n",
++                         (uint32_t)address, tlb_error);
++                storm_run = 0;
++            }
++        } else {
++            storm_addr = address;
++            storm_err = tlb_error;
++            storm_run = 0;
++        }
++    }
++
+     if (access_type == MMU_INST_FETCH) {
+         error_code |= EXCP_INST_NOTAVAIL;
+     }
+@@ -556,11 +681,29 @@
+     if (!(env->hflags & MIPS_HFLAG_DM)) {
+         env->CP0_BadVAddr = address;
+     }
+-    env->CP0_Context = (env->CP0_Context & ~0x007fffff) |
+-                       ((address >> 9) & 0x007ffff0);
+-    env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
+-                       (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
+-                       (address & (TARGET_PAGE_MASK << 1));
++    if (env->insn_flags & INSN_RLX4181) {
++        /*
++         * The RLX refill/TLB-change handlers index the PTE page
++         * with Context & 0xFFC directly (arch/rlx/mm/tlbex.c):
++         * the core stores the full VPN (address >> 12) at bit 2,
++         * not the standard BadVPN2 (address >> 13) at bit 4.
++         */
++        env->CP0_Context = (env->CP0_Context & ~0x003fffff) |
++                           ((address >> 10) & 0x003ffffc);
++    } else {
++        env->CP0_Context = (env->CP0_Context & ~0x007fffff) |
++                           ((address >> 9) & 0x007ffff0);
++    }
++    if (env->insn_flags & INSN_RLX4181) {
++        /* Single-page entries: EntryHi keeps VA bit 12. */
++        env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
++                           (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
++                           (address & TARGET_PAGE_MASK);
++    } else {
++        env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
++                           (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
++                           (address & (TARGET_PAGE_MASK << 1));
++    }
+ #if defined(TARGET_MIPS64)
+     env->CP0_EntryHi &= env->SEGMask;
+     env->CP0_XContext =
+@@ -1050,6 +1193,29 @@
+         (env->hflags & MIPS_HFLAG_DM)) {
+         cs->exception_index = EXCP_DINT;
+     }
++    if ((env->insn_flags & INSN_RLX4181) && rlx_trace_on() &&
++        (uint32_t)env->active_tc.PC < 0x80000000u &&
++        (cs->exception_index == EXCP_TLBRI ||
++         cs->exception_index == EXCP_TLBXI ||
++         cs->exception_index == EXCP_AdEL ||
++         cs->exception_index == EXCP_AdES ||
++         cs->exception_index == EXCP_RI ||
++         cs->exception_index == EXCP_CpU ||
++         cs->exception_index == EXCP_TRAP ||
++         cs->exception_index == EXCP_BREAK)) {
++        /* Bench diagnostic: name every fault userspace takes. */
++        qemu_log("rlx-ufault: excp=%d pc=0x%08x insn=0x%08x badv=0x%08x "
++                 "v0=%d a0=0x%08x sp=0x%08x ra=0x%08x asid=%d\n",
++                 cs->exception_index,
++                 (uint32_t)env->active_tc.PC,
++                 (uint32_t)cpu_ldl_code(env, env->active_tc.PC),
++                 (uint32_t)env->CP0_BadVAddr,
++                 (int)env->active_tc.gpr[2],
++                 (uint32_t)env->active_tc.gpr[4],
++                 (uint32_t)env->active_tc.gpr[29],
++                 (uint32_t)env->active_tc.gpr[31],
++                 (int)((env->CP0_EntryHi >> 6) & 0x3f));
++    }
+     offset = 0x180;
+     switch (cs->exception_index) {
+     case EXCP_SEMIHOST:
+@@ -1227,6 +1393,20 @@
+     case EXCP_SYSCALL:
+         cause = 8;
+         update_badinstr = 1;
++        if ((env->insn_flags & INSN_RLX4181) && rlx_trace_on() &&
++            getenv("RLX_SYSCALLS")) {
++            /* Bench diagnostic: name every syscall init makes. */
++            qemu_log("rlx-syscall: nr=%d a0=0x%08x a1=0x%08x "
++                     "a2=0x%08x asid=%d eh=0x%08x ra=0x%08x pc=0x%08x\n",
++                     (int)env->active_tc.gpr[2],
++                     (uint32_t)env->active_tc.gpr[4],
++                     (uint32_t)env->active_tc.gpr[5],
++                     (uint32_t)env->active_tc.gpr[6],
++                     (int)(env->CP0_EntryHi & 0xff),
++                     (uint32_t)env->CP0_EntryHi,
++                     (uint32_t)env->active_tc.gpr[31],
++                     (uint32_t)env->active_tc.PC);
++        }
+         goto set_EPC;
+     case EXCP_BREAK:
+         cause = 9;
+@@ -1324,7 +1504,32 @@
+             env->active_tc.PC = env->CP0_EBase & ~0xfff;
+         }
+ 
+-        env->active_tc.PC += offset;
++        if ((env->insn_flags & INSN_RLX4181) &&
++            !(env->CP0_Status & (1 << CP0St_BEV)) && offset != 0) {
++            /*
++             * RLX cores vector every non-refill exception and all
++             * interrupts to ebase + 0x80 (the vendor kernel's
++             * RLX_TRAP_VEC_BASE; the refill vector stays +0x00).
++             */
++            offset = 0x80;
++            env->active_tc.PC = (env->CP0_EBase & ~0xfff) + offset;
++        } else {
++            env->active_tc.PC += offset;
++        }
++        if (cause == 0) {
++            int lopi = mips_lx_lopi_line(env);
++
++            if (lopi >= 0) {
++                /*
++                 * Lexra LOPI delivery: same exception frame as a
++                 * standard interrupt, but the vector is the slot
++                 * for this line in the branch table the kernel
++                 * pointed IntVec at (rlx_vec_dispatch).
++                 */
++                env->active_tc.PC = (target_long)(int32_t)
++                    env->CP0_LXReg[2] + 8 * lopi;
++            }
++        }
+         set_hflags_for_handler(env);
+         env->CP0_Cause = (env->CP0_Cause & ~(0x1f << CP0Ca_EC)) |
+                          (cause << CP0Ca_EC);
+@@ -1398,6 +1603,9 @@
+ 
+     /* 1k pages are not supported. */
+     mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
++    if (env->insn_flags & INSN_RLX4181) {
++        mask = tlb->PageMask | ~TARGET_PAGE_MASK;
++    }
+     if (tlb->V0) {
+         addr = tlb->VPN & ~mask;
+ #if defined(TARGET_MIPS64)
+diff -ruN a/qemu-8.2.2/target/mips/tcg/sysemu_helper.h.inc b/qemu-8.2.2/target/mips/tcg/sysemu_helper.h.inc
+--- a/qemu-8.2.2/target/mips/tcg/sysemu_helper.h.inc	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/tcg/sysemu_helper.h.inc	2026-11-10 23:49:14.309248555 -0500
+@@ -177,6 +177,7 @@
+ /* Special */
+ DEF_HELPER_1(di, tl, env)
+ DEF_HELPER_1(ei, tl, env)
++DEF_HELPER_3(lx_irq_update, void, env, tl, i32)
+ DEF_HELPER_1(eret, void, env)
+ DEF_HELPER_1(eretnc, void, env)
+ DEF_HELPER_1(deret, void, env)
+diff -ruN a/qemu-8.2.2/target/mips/tcg/translate.c b/qemu-8.2.2/target/mips/tcg/translate.c
+--- a/qemu-8.2.2/target/mips/tcg/translate.c	2024-03-04 12:48:16.000000000 -0500
++++ b/qemu-8.2.2/target/mips/tcg/translate.c	2026-11-11 03:44:50.478000343 -0500
+@@ -926,7 +926,9 @@
+     OPC_MFC0     = (0x00 << 21) | OPC_CP0,
+     OPC_DMFC0    = (0x01 << 21) | OPC_CP0,
+     OPC_MFHC0    = (0x02 << 21) | OPC_CP0,
++    OPC_MFLXC0   = (0x03 << 21) | OPC_CP0,
+     OPC_MTC0     = (0x04 << 21) | OPC_CP0,
++    OPC_MTLXC0   = (0x07 << 21) | OPC_CP0,
+     OPC_DMTC0    = (0x05 << 21) | OPC_CP0,
+     OPC_MTHC0    = (0x06 << 21) | OPC_CP0,
+     OPC_MFTR     = (0x08 << 21) | OPC_CP0,
+@@ -8789,6 +8791,34 @@
+         }
+         opn = "mtc0";
+         break;
++    case OPC_MFLXC0:
++        /* Lexra LX register read (EStatus/ECause/IntVec/...). */
++        if (!(ctx->insn_flags & INSN_RLX4181)) {
++            goto die;
++        }
++        if (rt != 0) {
++            tcg_gen_ld_tl(cpu_gpr[rt], tcg_env,
++                          offsetof(CPUMIPSState, CP0_LXReg) +
++                          rd * sizeof(uint32_t));
++        }
++        opn = "mflxc0";
++        break;
++    case OPC_MTLXC0:
++        /* Lexra LX register write. */
++        if (!(ctx->insn_flags & INSN_RLX4181)) {
++            goto die;
++        }
++        {
++            TCGv t0 = tcg_temp_new();
++
++            gen_load_gpr(t0, rt);
++            tcg_gen_st_tl(t0, tcg_env,
++                          offsetof(CPUMIPSState, CP0_LXReg) +
++                          rd * sizeof(uint32_t));
++            gen_helper_lx_irq_update(tcg_env, t0, tcg_constant_i32(rd));
++        }
++        opn = "mtlxc0";
++        break;
+ #if defined(TARGET_MIPS64)
+     case OPC_DMFC0:
+         check_insn(ctx, ISA_MIPS3);
+@@ -8890,6 +8920,21 @@
+         }
+         gen_helper_tlbr(tcg_env);
+         break;
++    case OPC_RFE:
++        if (ctx->insn_flags & INSN_RLX4181) {
++            /*
++             * Lexra encodes ERET with function 0x10, the slot
++             * standard MIPS assigns to RFE: both the bootcode and
++             * the vendor kernel return from exceptions with
++             * 0x42000010 (see their handler epilogues).
++             */
++            opn = "eret";
++            check_insn(ctx, ISA_MIPS2);
++            gen_helper_eret(tcg_env);
++            ctx->base.is_jmp = DISAS_EXIT;
++            break;
++        }
++        goto die;
+     case OPC_ERET: /* OPC_ERETNC */
+         if ((ctx->insn_flags & ISA_MIPS_R6) &&
+             (ctx->hflags & MIPS_HFLAG_BMASK)) {
+@@ -8925,6 +8970,19 @@
+             ctx->base.is_jmp = DISAS_EXIT;
+         }
+         break;
++    case 0x38 | OPC_C0:
++        if (!(ctx->insn_flags & INSN_RLX4181)) {
++            goto die;
++        }
++        /*
++         * Lexra SLEEP (function 0x38): the vendor toolchain's
++         * power-down instruction -- the vendor kernel's idle
++         * loop executes it via __cpu_wait() under
++         * CONFIG_CPU_HAS_SLEEP.  Same guest-visible semantics
++         * as WAIT: halt until an interrupt is pending.
++         */
++        opn = "sleep";
++        goto do_wait;
+     case OPC_WAIT:
+         opn = "wait";
+         check_insn(ctx, ISA_MIPS3 | ISA_MIPS_R1);
+@@ -8932,6 +8990,7 @@
+             (ctx->hflags & MIPS_HFLAG_BMASK)) {
+             goto die;
+         }
++    do_wait:
+         /* If we get an exception, we want to restart at next instruction */
+         ctx->base.pc_next += 4;
+         save_cpu_state(ctx, 1);
+@@ -14744,6 +14803,8 @@
+         switch (op1) {
+         case OPC_MFC0:
+         case OPC_MTC0:
++        case OPC_MFLXC0:
++        case OPC_MTLXC0:
+         case OPC_MFTR:
+         case OPC_MTTR:
+         case OPC_MFHC0:
+@@ -15221,6 +15282,29 @@
+                 gen_reserved_instruction(ctx);
+                 break;
+             }
++        } else if (ctx->insn_flags & INSN_RLX4181) {
++            /*
++             * The Lexra RLX4181 has no FPU, yet its bootcode uses
++             * the COP1X indexed load/store encodings as a
++             * cache/local-memory diagnostic (under a CP0 test mode)
++             * and ignores the transferred data. On the core these
++             * do not raise CpU. Model them as NOPs; the remaining
++             * COP1X space stays reserved, as on an FPU-less core.
++             */
++            op1 = MASK_CP3(ctx->opcode);
++            switch (op1) {
++            case OPC_LWXC1:
++            case OPC_LDXC1:
++            case OPC_SWXC1:
++            case OPC_SDXC1:
++            case OPC_PREFX:
++                /* Treat as NOP. */
++                break;
++            default:
++                MIPS_INVAL("cp3-rlx");
++                gen_reserved_instruction(ctx);
++                break;
++            }
+         } else {
+             generate_exception_err(ctx, EXCP_CpU, 1);
+         }
